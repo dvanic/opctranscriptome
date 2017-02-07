@@ -1,0 +1,78 @@
+---
+title: "TF DE"
+author: "Darya Vanichkina"
+date: "30/11/2016"
+output: html_document
+---
+
+```{r Setup}
+library(dplyr)
+library(dtplyr)
+library(data.table)
+library(heatmap3)
+```
+
+
+```{r LoadAnno}
+tf <- read.csv("TFwGeneNames.csv", header = FALSE)
+names(tf) <- c("gene", "id", "mgi_symbol", "class")
+chrem <- read.table("Mus_musculus_chr_remodeling_factor_EnsemblID.txt")
+tfcof <- read.table("Mus_musculus_cofactor_EnsemblID.txt")
+names(chrem) <- c("gene")
+names(tfcof) <- c("gene")
+```
+
+
+```{r LoadData}
+cpm <- readRDS(file = "cpmTotal.Rds")
+cpm_med <- as.data.frame(apply(cpm, 1, function(x) median(x)))
+names(cpm_med) <- "median"
+cpm_med <- subset.data.frame(cpm_med, row.names(cpm_med) %in% tf$gene)
+
+
+BPvsE <- readRDS("BP7vsETotal.anno.Rds")
+SPvsE<- readRDS("SP7vsETotal.anno.Rds")
+PvsE <- readRDS("PvsEearlyTotal.anno.Rds")
+
+EBvsS <-readRDS("EBvsSTotal.anno.Rds")
+PBvsS <- readRDS("P7BvsSTotal.anno.Rds")
+BvsS <- readRDS("BvsSearlyTotal.anno.Rds")
+
+allDE <- bind_rows(BPvsE, SPvsE, PvsE, EBvsS, PBvsS,BvsS)
+tfDE <- allDE %>% filter(genes %in% tf$gene)
+tfDEmost <- tfDE %>% filter(abs(logFC) >=8)
+
+tf %>% filter(gene %in% tfDEmost$genes) %>% select(unique(mgi_symbol))
+
+tfDE %>% filter(genes %in% c("ENSMUSG00000046160", "ENSMUSG00000039830", "ENSMUSG00000027434", "ENSMUSG00000033006")) %>% select(logFC)
+```
+
+```{r HeatmapDE}
+cpm_tfde <- as.data.frame(cpm[row.names(cpm) %in% tfDEmost$genes,])
+cpm_tfde <- merge.data.frame(log(as.matrix(cpm_tfde+1)),tf, by.x=0, by.y = "gene")
+rownames(cpm_tfde) <- cpm_tfde$mgi_symbol
+heatmap3(cpm_tfde[,2:13], Rowv = TRUE, Colv=TRUE, method="complete", ColSideCut = 0.07,ColSideWidth=0.8, col=colorRampPalette(c("#2c7bb6", "#ffffbf", "#d7191c"))(1024), balanceColor = TRUE)
+```
+
+
+```{r HeatmapAll}
+cpm_tf <- as.data.frame(cpm[row.names(cpm) %in% tf$gene,])
+cpm_tf <- merge.data.frame(log(as.matrix(cpm_tf+1)),tf, by.x=0, by.y = "gene")
+cpm_tf <- subset.data.frame(cpm_tf, rowSums(cpm_tf[2:13],) > 12)
+cpm_tf <- cpm_tf %>% filter(mgi_symbol != "")
+rownames(cpm_tf) <- cpm_tf$mgi_symbol
+heatmap3(cpm_tf[,2:13], Rowv = TRUE, Colv=TRUE, method="complete", ColSideCut = 0.07,ColSideWidth=0.8, col=colorRampPalette(c("#2c7bb6", "#ffffbf", "#d7191c"))(1024), balanceColor = TRUE)
+```
+
+```{r HeatmapPvsE}
+tf_pvse <- bind_rows(BPvsE, SPvsE, PvsE) %>% filter(genes %in% tf$gene) %>% filter(abs(logFC) >= 4.5) %>% select(genes) %>% distinct()
+
+cpm_pvse <- as.data.frame(cpm[row.names(cpm) %in% tf_pvse$genes,])
+cpm_pvse <- merge.data.frame(log(as.matrix(cpm_pvse+1)),tf, by.x=0, by.y = "gene")
+cpm_pvse <- subset.data.frame(cpm_pvse, rowSums(cpm_pvse[2:13],) > 12)
+cpm_pvse <- cpm_pvse %>% filter(mgi_symbol != "")
+rownames(cpm_pvse) <- cpm_pvse$mgi_symbol
+heatmap3(cpm_pvse[,2:13], Rowv = TRUE, Colv=TRUE, method="complete", ColSideCut = 0.07,ColSideWidth=0.8, col=colorRampPalette(c("#2c7bb6", "#ffffbf", "#d7191c"))(1024), balanceColor = TRUE)
+dev.off()
+```
+

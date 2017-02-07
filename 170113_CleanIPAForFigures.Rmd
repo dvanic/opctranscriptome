@@ -1,0 +1,203 @@
+---
+title: "170113_CleanIPAForFigures"
+author: "Darya Vanichkina"
+date: "13/01/2017"
+output: html_document
+---
+```{r}
+library(dplyr)
+library(dtplyr)
+
+library(openxlsx) # exporting to excel
+listofobjectstoxls <- function(characterlistofobjectnames, filename = "outputworksheet", suffix = ""){
+  # Test that all objects exist
+  for (object in paste0(characterlistofobjectnames, suffix, sep = "")) {
+    if (exists(object) == FALSE) {
+        stop(paste0(paste0("The object ", object), " does not exist! Please edit your input list before continuing."))
+      }
+  }
+
+  tmpworkbookname <- createWorkbook()
+    for (object in characterlistofobjectnames) {
+        addWorksheet(wb = tmpworkbookname, sheetName = object, gridLines = FALSE)
+        writeData(wb = tmpworkbookname, sheet = object, x = eval(as.name(paste0(object, suffix))), borders = "none")
+    }
+  saveWorkbook(tmpworkbookname, file = filename, overwrite = TRUE)
+  rm(tmpworkbookname, object)
+}
+```
+
+
+```{r LoadData}
+setwd("..")
+PvsE <- read.table("finaliparesults/PvsE_4FC_0.01p.txt", sep = "\t", skip = 2, header = TRUE, quote = "")
+BPvsE <- read.table("finaliparesults/BPvsE_4FC_0.01p.txt", sep = "\t", skip = 2, header = TRUE, quote = "")
+SPvsE <- read.table("finaliparesults/SPvsE_4FC_0.01p.txt", sep = "\t", skip = 2, header = TRUE, quote = "")
+BvsS <- read.table("finaliparesults/BvsS_4FC_0.01p.txt", sep = "\t", skip = 2, header = TRUE, quote = "")
+EBvsS <- read.table("finaliparesults/EBvsS_4FC_0.01p.txt", sep = "\t", skip = 2, header = TRUE, quote = "")
+PBvsS <- read.table("finaliparesults/PBvsS_4FC_0.01p.txt", sep = "\t", skip = 2, header = TRUE, quote = "")
+```
+
+```{r CountNumberOfInteractors}
+PvsE$partners <- sapply(PvsE$Target.molecules.in.dataset, function(x) lengths(regmatches(x, gregexpr(",", x))))
+BPvsE$partners <- sapply(BPvsE$Target.molecules.in.dataset, function(x) lengths(regmatches(x, gregexpr(",", x))))
+SPvsE$partners <- sapply(SPvsE$Target.molecules.in.dataset, function(x) lengths(regmatches(x, gregexpr(",", x))))
+BvsS$partners <- sapply(BvsS$Target.molecules.in.dataset, function(x) lengths(regmatches(x, gregexpr(",", x))))
+EBvsS$partners <- sapply(EBvsS$Target.molecules.in.dataset, function(x) lengths(regmatches(x, gregexpr(",", x))))
+PBvsS$partners <- sapply(PBvsS$Target.molecules.in.dataset, function(x) lengths(regmatches(x, gregexpr(",", x))))
+ 
+```
+
+``` {r BvsS}
+BvsS %>% 
+  filter(p.value.of.overlap < 0.01) %>%
+  filter(partners >=10) %>% 
+  filter(Molecule.Type %in% c("complex","cytokine", "enzyme","g-protein coupled receptor", "group", "growth factor", "ion channel", "kinase", "ligand-dependent nuclear receptor", "mature microrna", "microrna", "other", "peptidase", "phosphatase", "transcription regulator", "translation regulator", "transmembrane receptor", "transporter")) %>%
+  select(Upstream.Regulator)
+
+# Which categories should I leave in if I require 10? 
+cat10 <- BvsS %>% 
+  filter(p.value.of.overlap <= 0.01) %>%
+  filter(partners >= 10) %>% 
+  filter(Molecule.Type %in% c("complex","cytokine", "enzyme","g-protein coupled receptor", "group", "growth factor", "ion channel", "kinase", "ligand-dependent nuclear receptor", "mature microrna", "microrna", "other", "peptidase", "phosphatase", "transcription regulator", "translation regulator", "transmembrane receptor", "transporter")) %>%
+  select(Molecule.Type) %>%
+  distinct()
+as.character(cat10$Molecule.Type[order(cat10$Molecule.Type)])
+```
+
+``` {r EBvsS}
+EBvsS %>% 
+  filter(p.value.of.overlap < 0.01) %>%
+  filter(partners >=10) %>% 
+  filter(Molecule.Type %in% c("complex","cytokine", "enzyme","g-protein coupled receptor", "group", "growth factor", "ion channel", "kinase", "ligand-dependent nuclear receptor", "mature microrna", "microrna", "other", "peptidase", "phosphatase", "transcription regulator", "translation regulator", "transmembrane receptor", "transporter")) %>%
+  select(Upstream.Regulator)
+
+# Which categories should I leave in if I require 10? 
+cat10 <- EBvsS %>% 
+  filter(p.value.of.overlap <= 0.01) %>%
+  filter(partners >= 10) %>% 
+  filter(Molecule.Type %in% c("complex","cytokine", "enzyme","g-protein coupled receptor", "group", "growth factor", "ion channel", "kinase", "ligand-dependent nuclear receptor", "mature microrna", "microrna", "other", "peptidase", "phosphatase", "transcription regulator", "translation regulator", "transmembrane receptor", "transporter")) %>%
+  select(Molecule.Type) %>%
+  distinct()
+as.character(cat10$Molecule.Type[order(cat10$Molecule.Type)])
+```
+
+``` {r PBvsS}
+PBvsS %>% 
+  filter(p.value.of.overlap < 0.01) %>%
+  filter(partners >=10) %>% 
+  filter(Molecule.Type %in% c("complex","cytokine", "enzyme","g-protein coupled receptor", "group", "growth factor", "ion channel", "kinase", "ligand-dependent nuclear receptor", "mature microrna", "microrna", "other", "peptidase", "phosphatase", "transcription regulator", "translation regulator", "transmembrane receptor", "transporter")) %>%
+  select(Upstream.Regulator)
+
+# Which categories should I leave in if I require 10? 
+cat10 <- PBvsS %>% 
+  filter(p.value.of.overlap <= 0.01) %>%
+  filter(partners >= 10) %>% 
+  filter(Molecule.Type %in% c("complex","cytokine", "enzyme","g-protein coupled receptor", "group", "growth factor", "ion channel", "kinase", "ligand-dependent nuclear receptor", "mature microrna", "microrna", "other", "peptidase", "phosphatase", "transcription regulator", "translation regulator", "transmembrane receptor", "transporter")) %>%
+  select(Molecule.Type) %>%
+  distinct()
+as.character(cat10$Molecule.Type[order(cat10$Molecule.Type)])
+```
+
+
+``` {r PvsE}
+PvsE %>% 
+  filter(p.value.of.overlap < 0.01) %>%
+  filter(partners >=10) %>% 
+  filter(Molecule.Type %in% c("complex","cytokine", "enzyme","g-protein coupled receptor", "group", "growth factor", "ion channel", "kinase", "ligand-dependent nuclear receptor", "mature microrna", "microrna", "other", "peptidase", "phosphatase", "transcription regulator", "translation regulator", "transmembrane receptor", "transporter")) %>%
+  select(Upstream.Regulator)
+
+
+# Which categories should I leave in if I require 10? 
+cat10 <- PvsE %>% 
+  filter(p.value.of.overlap <= 0.01) %>%
+  filter(partners >= 10) %>% 
+  filter(Molecule.Type %in% c("complex","cytokine", "enzyme","g-protein coupled receptor", "group", "growth factor", "ion channel", "kinase", "ligand-dependent nuclear receptor", "mature microrna", "microrna", "other", "peptidase", "phosphatase", "transcription regulator", "translation regulator", "transmembrane receptor", "transporter")) %>%
+  select(Molecule.Type) %>%
+  distinct()
+as.character(cat10$Molecule.Type[order(cat10$Molecule.Type)])
+
+
+```
+
+
+``` {r BPvsE}
+BPvsE %>% 
+  filter(p.value.of.overlap < 0.01) %>%
+  filter(partners >=10) %>% 
+  filter(Molecule.Type %in% c("complex","cytokine", "enzyme","g-protein coupled receptor", "group", "growth factor", "ion channel", "kinase", "ligand-dependent nuclear receptor", "mature microrna", "microrna", "other", "peptidase", "phosphatase", "transcription regulator", "translation regulator", "transmembrane receptor", "transporter")) %>%
+  select(Upstream.Regulator)
+
+# Which categories should I leave in if I require 10? 
+cat10 <- BPvsE %>% 
+  filter(p.value.of.overlap <= 0.01) %>%
+  filter(partners >= 10) %>% 
+  filter(Molecule.Type %in% c("complex","cytokine", "enzyme","g-protein coupled receptor", "group", "growth factor", "ion channel", "kinase", "ligand-dependent nuclear receptor", "mature microrna", "microrna", "other", "peptidase", "phosphatase", "transcription regulator", "translation regulator", "transmembrane receptor", "transporter")) %>%
+  select(Molecule.Type) %>%
+  distinct()
+as.character(cat10$Molecule.Type[order(cat10$Molecule.Type)])
+```
+
+``` {r SPvsE}
+SPvsE %>% 
+  filter(p.value.of.overlap < 0.01) %>%
+  filter(partners >=10) %>% 
+  filter(Molecule.Type %in% c("complex","cytokine", "enzyme","g-protein coupled receptor", "group", "growth factor", "ion channel", "kinase", "ligand-dependent nuclear receptor", "mature microrna", "microrna", "other", "peptidase", "phosphatase", "transcription regulator", "translation regulator", "transmembrane receptor", "transporter")) %>%
+  select(Upstream.Regulator)
+
+# Which categories should I leave in if I require 10? 
+cat10 <- SPvsE %>% 
+  filter(p.value.of.overlap <= 0.01) %>%
+  filter(partners >= 10) %>% 
+  filter(Molecule.Type %in% c("complex","cytokine", "enzyme","g-protein coupled receptor", "group", "growth factor", "ion channel", "kinase", "ligand-dependent nuclear receptor", "mature microrna", "microrna", "other", "peptidase", "phosphatase", "transcription regulator", "translation regulator", "transmembrane receptor", "transporter")) %>%
+  select(Molecule.Type) %>%
+  distinct()
+as.character(cat10$Molecule.Type[order(cat10$Molecule.Type)])
+```
+
+Clean up final for excel
+
+```{r ExportToExcel}
+listofobjectstoxls(characterlistofobjectnames = c( "PvsE", "BPvsE","SPvsE", "BvsS", "EBvsS", "PBvsS"), filename = "bulkIPA.xlsx", suffix = "")
+```
+
+
+```{r HeatmapForPaper}
+cpmm <- readRDS("../160923_DGEAgo/cpmTotalP7P90.Rds")
+cpmm <- subset.data.frame(cpmm, select = c("Row.names", "E13.5B1", "E13.5B2", "E13.5B3", "E13.5S1", "E13.5S2", "E13.5S3", "P7S1", "P7S2", "P7S3", "P7B1", "P7B2", "P7B3", "mgi_symbol")) 
+
+PvsE.list <- PvsE %>% 
+  filter(p.value.of.overlap < 0.01) %>%
+  filter(abs(Activation.z.score) > .7) %>%
+  filter(Molecule.Type %in% c("complex","cytokine", "enzyme","g-protein coupled receptor", "group", "growth factor", "ion channel", "kinase", "ligand-dependent nuclear receptor", "mature microrna", "microrna", "other", "peptidase", "phosphatase", "transcription regulator", "translation regulator", "transmembrane receptor", "transporter")) %>%
+  select(Upstream.Regulator)
+
+BvsS.list <- BvsS %>% 
+  filter(p.value.of.overlap < 0.01) %>%
+  filter(abs(Activation.z.score) > .7) %>%
+  filter(Molecule.Type %in% c("complex","cytokine", "enzyme","g-protein coupled receptor", "group", "growth factor", "ion channel", "kinase", "ligand-dependent nuclear receptor", "mature microrna", "microrna", "other", "peptidase", "phosphatase", "transcription regulator", "translation regulator", "transmembrane receptor", "transporter")) %>%
+  select(Upstream.Regulator)
+
+
+
+
+genes4IPA <- union(as.character(PvsE.list$Upstream.Regulator), as.character(BvsS.list$Upstream.Regulator))
+rm(BvsS.list,PvsE.list)
+
+simpleCap <- function(x) {
+  s <- strsplit(x, " ")[[1]]
+  paste(toupper(substring(s, 1,1)), tolower(substring(s, 2)),
+      sep="", collapse=" ")
+}
+
+genes4IPA <- sapply(genes4IPA, simpleCap)
+names(genes4IPA) <- NULL
+
+library(heatmap3)
+
+genes4IPA_CPMM <- subset.data.frame(cpmm, (cpmm$mgi_symbol %in% genes4IPA) , select=c("Row.names", "E13.5B1", "E13.5B2", "E13.5B3", "E13.5S1", "E13.5S2", "E13.5S3", "P7S1", "P7S2", "P7S3", "P7B1", "P7B2", "P7B3",  "mgi_symbol"))
+rownames(genes4IPA_CPMM) <- genes4IPA_CPMM$mgi_symbol
+genes4IPA_CPMM <- subset.data.frame(genes4IPA_CPMM, rowSums(genes4IPA_CPMM[,2:13]) > 0 )
+heatmap3(genes4IPA_CPMM[,2:13], Rowv = TRUE, Colv=TRUE, method="complete", ColSideCut = 0.07,ColSideWidth=0.8, col=colorRampPalette(c("#2c7bb6", "#ffffbf", "#d7191c"))(1024), balanceColor = TRUE)
+```
+

@@ -1,0 +1,514 @@
+---
+title: "Novel Gene Clean-up and DE"
+author: "Darya Vanichkina"
+output: html_document
+---
+
+```{r LoadFunct}
+
+library(dtplyr)
+library(dplyr)
+library(openxlsx) # exporting to excel
+library(heatmap3)
+
+round_df <- function(df, digits) {
+  nums <- vapply(df, is.numeric, FUN.VALUE = logical(1))
+  df[,nums] <- round(df[,nums], digits = digits)
+  (df)
+}
+
+listofobjectstoxls <- function(characterlistofobjectnames, filename = "outputworksheet", suffix = "", prefix = ""){
+  # Test that all objects exist
+  for (object in paste0(paste0(prefix, characterlistofobjectnames, sep = ""), suffix, sep = "")) {
+    if (exists(object) == FALSE) {
+        stop(paste0(paste0("The object ", object), " does not exist! Please edit your input list before continuing."))
+      }
+  }
+
+  tmpworkbookname <- createWorkbook()
+    for (object in characterlistofobjectnames) {
+        addWorksheet(wb = tmpworkbookname, sheetName = object, gridLines = FALSE)
+        writeData(wb = tmpworkbookname, sheet = object, x = eval(as.name(paste0(prefix, paste0(object, suffix)))), borders = "none")
+    }
+  saveWorkbook(tmpworkbookname, file = filename, overwrite = TRUE)
+  rm(tmpworkbookname, object)
+}
+# listofobjectstoxls(characterlistofobjectnames = comparisonsOfInterestTotal, filename = "topGO_elim.xlsx", suffix = "Total.GO")
+```
+
+
+```{r loadData, include=FALSE}
+setwd("/Users/darya/Documents/01_Postdoc/03_OPC/161205_noveltranscripts/")
+novels <- read.table("merged_feelncfiltered.gtf")
+names(novels) <- c("chr", "Stringtie", "exon", "start", "end", "score", "strand", "frame", "gene_id", "gene", "semicolon1", "transcript_id", "transcript", "semicolon2", "exon_number", "exonActualNumber", "semicolon3")
+
+lncRNA <- read.table("merged_nooverlap.gtf.lncRNA_classes.1.txt")
+mRNA <- read.table("merged_nooverlap.gtf.mRNA_classes.1.txt")
+noORF <- read.table("merged_nooverlap.gtf.noORF_classes.1.txt")
+names(lncRNA) <- c("one", "gene", "transcript", "adjacentgene", "adjacenttranscript", "sense", "genic", "int", "orientation", "location")
+names(mRNA) <- c("one", "gene", "transcript", "adjacentgene", "adjacenttranscript", "sense", "genic", "int", "orientation", "location")
+names(noORF) <- c("one", "gene", "transcript", "adjacentgene", "adjacenttranscript", "sense", "genic", "int", "orientation", "location")
+lncRNA$class <- "lncRNA"
+mRNA$class <- "mRNA"
+noORF$class <- "noORF"
+mRNA$adjacentgene <- ""
+mRNA$adjacenttranscript <- ""
+mRNA$sense <- ""
+mRNA$genic <- ""
+mRNA$int <- ""
+mRNA$orientation <- ""
+predictedclasses <- rbind(mRNA, rbind(lncRNA, noORF))
+rm(lncRNA, mRNA, noORF)
+
+codingpotential <- read.table("merged_nooverlap.gtf_RF.txt", header = TRUE)
+```
+
+List of lncRNA without interaction : MSTRG.37244.6 MSTRG.10771.2 MSTRG.16868.2 MSTRG.21858.1 MSTRG.14469.1 MSTRG.34991.1 MSTRG.10771.4 MSTRG.3000.1 MSTRG.10771.1 MSTRG.36075.1 MSTRG.37244.5 MSTRG.14.1 MSTRG.3001.1 MSTRG.1463.1 MSTRG.3002.2 MSTRG.3006.1 MSTRG.14266.1 MSTRG.14409.4 MSTRG.16868.1 MSTRG.34993.1 MSTRG.14411.3 MSTRG.14409.6 MSTRG.26241.13 MSTRG.14411.4 MSTRG.10771.3 MSTRG.13538.1 MSTRG.14411.2 MSTRG.14410.1 MSTRG.13543.1 MSTRG.14410.2 MSTRG.14414.1 MSTRG.14413.1 MSTRG.36171.1 MSTRG.3005.1
+
+Total 34 ncRNA.
+
+
+```{r BindItAll}
+novels_classed <- merge.data.frame(novels, predictedclasses, by="transcript", all.x = TRUE)
+novels_classed_coded <- merge.data.frame(novels_classed, codingpotential, by.x= "transcript", by.y="name", all.x=TRUE)
+table(novels_classed_coded[is.na(novels_classed_coded$coding_potential),]$class)
+novels_classed_coded$kmerScore_1mer <- NULL
+novels_classed_coded$kmerScore_2mer <- NULL
+novels_classed_coded$kmerScore_3mer <- NULL
+novels_classed_coded$kmerScore_6mer <- NULL
+novels_classed_coded$kmerScore_9mer <- NULL
+novels_classed_coded$label <- NULL
+novels_classed_coded$gene.x  <- NULL
+
+novels_classed_coded$score <- 1000 * novels_classed_coded$coding_potential
+novels_classed_coded$score[is.na(novels_classed_coded$score)] <- 0
+
+novels_classed_coded_gtf <- novels_classed_coded[,c("chr", "Stringtie", "exon", "start", "end", "score", "strand", "frame")]
+novels_classed_coded_gtf$field9 <- paste(paste(paste(paste(paste(paste(paste(paste(paste(paste(paste(
+  paste(novels_classed_coded$gene_id, paste0(paste0("\"", novels_classed_coded$gene.y), "\""), sep = " "),
+  paste(novels_classed_coded$transcript_id, paste0(paste0("\"", novels_classed_coded$transcript), "\""), sep = " "), 
+  sep = "; "),
+  paste(novels_classed_coded$exon_number, paste0(paste0("\"", novels_classed_coded$exonActualNumber), "\""), sep = " "),
+  sep = "; "),
+  paste("class", paste0(paste0("\"", novels_classed_coded$class), "\""), sep = " "),
+  sep = "; "),
+  paste("adjacent_gene", paste0(paste0("\"", novels_classed_coded$adjacentgene), "\""), sep = " "),
+  sep = "; "),
+  paste("adjacent_transcript", paste0(paste0("\"", novels_classed_coded$adjacenttranscript), "\""), sep = " "),
+  paste("sense", paste0(paste0("\"", novels_classed_coded$sense), "\""), sep = " "),
+  sep = "; "),
+  paste("genic", paste0(paste0("\"", novels_classed_coded$genic), "\""), sep = " "),
+  sep = "; "),
+  paste("orientation", paste0(paste0("\"", novels_classed_coded$orientation), "\""), sep = " "),
+  paste("distance", paste0(paste0("\"", novels_classed_coded$int), "\""), sep = " "),
+  sep = "; "),
+  paste("location", paste0(paste0("\"", novels_classed_coded$location), "\""), sep = " "),
+  sep = "; "),
+  paste("ORF_cover", paste0(paste0("\"", novels_classed_coded$ORF_cover), "\""), sep = " "),
+  sep = "; "),
+  paste("RNA_size", paste0(paste0("\"", novels_classed_coded$RNA_size), "\""), sep = " "),
+  sep = "; "),
+  sep = "; ")
+
+novels_classed_coded_gtf <- novels_classed_coded_gtf[order(novels_classed_coded_gtf$chr, novels_classed_coded_gtf$start),]
+write.table(novels_classed_coded_gtf, "novels_classed_coded.gtf", quote= FALSE, row.names = FALSE ,col.names  = FALSE, sep = "\t")
+
+```
+
+
+
+```{r DifferentialExpressionLoad}
+# Import the data ----
+setwd("./counttables/")
+file_list <- list.files(".",pattern = "\\multicounts.txt$")
+counttableComplete <- do.call("cbind",lapply(file_list,FUN=function(files){read.table(files,header=FALSE, skip=2,colClasses = c("character", rep("NULL", 4), "numeric", "numeric"),  sep="\t", col.names=c("Gene",rep("nothing", 4), "length", files))}))
+row.names(counttableComplete) <- substr(counttableComplete$Gene,1,18)
+for (i in 1:(ncol(counttableComplete)/3)) {counttableComplete$Gene <- NULL}
+counttableCompleteLen <- subset.data.frame(counttableComplete, select="length")
+for (i in 1:(ncol(counttableComplete)/2)) {counttableComplete$length <- NULL}
+
+counttableCompleteLen.vector <- as.numeric(counttableCompleteLen[,"length"])
+names(counttableCompleteLen.vector) <- row.names(counttableCompleteLen)
+
+names(counttableComplete) <- substr(names(counttableComplete), 1, nchar(names(counttableComplete))-16)
+rm(file_list,i)
+setwd("../")
+
+
+counttableComplete_tmp <-round_df(counttableComplete, digits=1)
+counttableComplete_tmp2 <- data.frame(apply(counttableComplete_tmp, 2, function(x) as.integer(x)))
+row.names(counttableComplete_tmp2) <- row.names(counttableComplete)
+counttableComplete <- counttableComplete_tmp2
+rm(counttableComplete_tmp2, counttableComplete_tmp)
+counttable <- counttableComplete
+rm(counttableComplete)
+counttableTotal <- counttable
+
+```
+
+
+```{r DE}
+library(limma)
+library("edgeR")
+groupsTotal <- substr(names(counttableTotal),1, nchar(names(counttableTotal)) - 1 )
+groups.df.Total <- data.frame(groupsTotal)
+groups.df.Total$sample <- names(counttableTotal)
+groups.df.Total$stage <- as.factor(substr(groupsTotal, 1, nchar(groupsTotal)-1))
+groups.df.Total$region <- as.factor(substr(groupsTotal, nchar(groupsTotal), nchar(groupsTotal)))
+groups.df.Total$stage <- relevel(groups.df.Total$stage, ref="E13.5")
+rm(groupsTotal)
+
+designTotal <- model.matrix(~ 0 + groupsTotal, data=groups.df.Total)
+designTotal
+colnames(designTotal) <- levels(groups.df.Total$groupsTotal)
+
+yTotal <- DGEList(counts=counttableTotal, genes=row.names(counttableTotal))
+yTotalunfiltered <- yTotal
+isexprTotal <- rowSums(cpm(yTotal)>0.7) >= 3
+limmatestedTotal <- as.vector((yTotal$genes))
+yTotal <- yTotal[isexprTotal,]
+dim(yTotal)
+yTotal$samples$lib.size <- colSums(yTotal$counts)
+yTotal <- calcNormFactors(yTotal)
+vTotal <- voom(yTotal,designTotal,plot=TRUE)
+fitTotal <- lmFit(vTotal,designTotal)
+
+yTotalunfiltered <- calcNormFactors(yTotalunfiltered)
+cpmTotal <- cpm(yTotalunfiltered)
+
+contrast.matrixTotal <- makeContrasts(EBvsS=E13.5B-E13.5S,
+                                 P7BvsS=P7B-P7S,
+                                 BvsSearly=0.5*(E13.5B+P7B)-0.5*(E13.5S+P7S),
+                                 BP7vsE=P7B-E13.5B,
+                                 SP7vsE=P7S-E13.5S,
+                                 PvsEearly=0.5*(P7B+P7S)-0.5*(E13.5B+E13.5S),
+                                 levels=designTotal)
+
+fit2Total <- contrasts.fit(fitTotal, contrast.matrixTotal)
+fit2Total <- eBayes(fit2Total)
+resultsTotal <- decideTests(fit2Total,p.value=0.05, lfc=1)
+summary(resultsTotal)
+
+EBvsSTotal <-topTable(fit2Total,  adjust="BH",lfc=1,p.value=0.05, number=Inf, sort="logFC",coef="EBvsS")
+P7BvsSTotal <- topTable(fit2Total,  adjust="BH",lfc=1,p.value=0.05, number=Inf, sort="logFC",coef="P7BvsS")
+BvsSearlyTotal <- topTable(fit2Total,  adjust="BH",lfc=1,p.value=0.05, number=Inf, sort="logFC",coef="BvsSearly")
+BP7vsETotal <- topTable(fit2Total,  adjust="BH",lfc=1,p.value=0.05, number=Inf, sort="logFC",coef="BP7vsE")
+SP7vsETotal <- topTable(fit2Total,  adjust="BH",lfc=1,p.value=0.05, number=Inf, sort="logFC",coef="SP7vsE")
+PvsEearlyTotal <- topTable(fit2Total,  adjust="BH",lfc=1,p.value=0.05, number=Inf, sort="logFC",coef="PvsEearly")
+
+EBvsSTotal <- subset.data.frame(EBvsSTotal, substr(EBvsSTotal$genes, 1,5) == "MSTRG") 
+P7BvsSTotal <- subset.data.frame(P7BvsSTotal, substr(P7BvsSTotal$genes, 1,5) == "MSTRG") 
+BvsSearlyTotal <- subset.data.frame(BvsSearlyTotal, substr(BvsSearlyTotal$genes, 1,5) == "MSTRG") 
+BP7vsETotal <- subset.data.frame(BP7vsETotal, substr(BP7vsETotal$genes, 1,5) == "MSTRG") 
+SP7vsETotal <- subset.data.frame(SP7vsETotal, substr(SP7vsETotal$genes, 1,5) == "MSTRG") 
+PvsEearlyTotal <- subset.data.frame(PvsEearlyTotal, substr(PvsEearlyTotal$genes, 1,5) == "MSTRG") 
+
+```
+
+```{r CleanUpNovelsClassedCoded}
+novels_classed_coded_clean <- unique(subset.data.frame(novels_classed_coded, select = c("transcript","gene.y", "adjacentgene", "adjacenttranscript", "sense", "genic", "int", "orientation", "location", "class", "ORF_cover", "RNA_size", "coding_potential","chr","strand")))
+novels_classed_coded_clean$adjacentgene <- substr(novels_classed_coded_clean$adjacentgene, 1, 18)
+novels_classed_coded_clean$adjacenttranscript <- substr(novels_classed_coded_clean$adjacenttranscript, 1, 18)
+
+novels_classed_coded_transcripts <- unique(subset.data.frame(novels_classed_coded,  select = c("transcript", "start" ,"end","exonActualNumber")))
+
+
+library(dtplyr)
+ends <- novels_classed_coded_transcripts %>% 
+             group_by(transcript) %>%
+             filter(exonActualNumber == max(exonActualNumber)) %>%
+             arrange(transcript,end,exonActualNumber) %>%
+             select(transcript, end)
+
+starts <- novels_classed_coded_transcripts %>% 
+             group_by(transcript) %>%
+             filter(exonActualNumber == min(exonActualNumber)) %>%
+             arrange(transcript,end,exonActualNumber) %>%
+             select(transcript, start)
+novels_classed_coded_transcripts <- merge.data.frame(starts, ends, by="transcript")
+
+names(novels_classed_coded)
+```
+
+
+```{r AnnoNovel}
+gene.anno <- read.csv("../160923_DGEAgo/annotationBiomart.txt")
+names(gene.anno) <- c("ensembl_gene_id","mgi_symbol", "description", "gene_biotype")
+
+EBvsSTotal.anno <- merge.data.frame(merge.data.frame(EBvsSTotal, novels_classed_coded_clean, by.x="genes", by.y = "gene.y"), gene.anno, by.x="adjacentgene", by.y="ensembl_gene_id", all.x = TRUE)
+P7BvsSTotal.anno <- merge.data.frame(merge.data.frame(P7BvsSTotal, novels_classed_coded_clean, by.x="genes", by.y = "gene.y"), gene.anno, by.x="adjacentgene", by.y="ensembl_gene_id", all.x = TRUE)
+BvsSearlyTotal.anno <- merge.data.frame(merge.data.frame(BvsSearlyTotal, novels_classed_coded_clean, by.x="genes", by.y = "gene.y"), gene.anno, by.x="adjacentgene", by.y="ensembl_gene_id", all.x = TRUE)
+BP7vsETotal.anno <- merge.data.frame(merge.data.frame(BP7vsETotal, novels_classed_coded_clean, by.x="genes", by.y = "gene.y"), gene.anno, by.x="adjacentgene", by.y="ensembl_gene_id", all.x = TRUE)
+SP7vsETotal.anno <- merge.data.frame(merge.data.frame(SP7vsETotal, novels_classed_coded_clean, by.x="genes", by.y = "gene.y"), gene.anno, by.x="adjacentgene", by.y="ensembl_gene_id", all.x = TRUE)
+PvsEearlyTotal.anno <- merge.data.frame(merge.data.frame(PvsEearlyTotal, novels_classed_coded_clean, by.x="genes", by.y = "gene.y"), gene.anno, by.x="adjacentgene", by.y="ensembl_gene_id", all.x = TRUE)
+```
+
+
+
+
+
+
+```{r CodingGenesOnlyImport}
+EBvsSTotal.imported <- readRDS("../160923_DGEAgo/EBvsSTotal.anno.Rds")
+P7BvsSTotal.imported <- readRDS("../160923_DGEAgo/P7BvsSTotal.anno.Rds")
+BvsSearlyTotal.imported <- readRDS("../160923_DGEAgo/BvsSearlyTotal.anno.Rds")
+BP7vsETotal.imported <- readRDS("../160923_DGEAgo/BP7vsETotal.anno.Rds")
+SP7vsETotal.imported <- readRDS("../160923_DGEAgo/SP7vsETotal.anno.Rds")
+PvsEearlyTotal.imported <- readRDS("../160923_DGEAgo/PvsEearlyTotal.anno.Rds")
+```
+
+
+```{r ExploreHe}
+# novel according to us
+#lncOL1
+EBvsSTotal.anno %>% filter(genes == "MSTRG.11787")
+#P7BvsSTotal.anno %>% filter(genes == "MSTRG.11787")
+#BvsSearlyTotal.anno %>% filter(genes == "MSTRG.11787")
+BP7vsETotal.anno %>% filter(genes == "MSTRG.11787")
+SP7vsETotal.anno %>% filter(genes == "MSTRG.11787")
+PvsEearlyTotal.anno %>% filter(genes == "MSTRG.11787")
+
+# known according to us
+# lncOL2 - ENSMUSG00000097736
+#EBvsSTotal.imported %>% filter(genes == "ENSMUSG00000097736")
+P7BvsSTotal.imported %>% filter(genes == "ENSMUSG00000097736")
+BvsSearlyTotal.imported %>% filter(genes == "ENSMUSG00000097736")
+BP7vsETotal.imported %>% filter(genes == "ENSMUSG00000097736")
+SP7vsETotal.imported %>% filter(genes == "ENSMUSG00000097736")
+PvsEearlyTotal.imported %>% filter(genes == "ENSMUSG00000097736")
+
+# known according to us
+# lncOL3 - ENSMUSG00000100147
+#EBvsSTotal.imported %>% filter(genes == "ENSMUSG00000100147")
+P7BvsSTotal.imported %>% filter(genes == "ENSMUSG00000100147")
+#BvsSearlyTotal.imported %>% filter(genes == "ENSMUSG00000100147")
+BP7vsETotal.imported %>% filter(genes == "ENSMUSG00000100147")
+SP7vsETotal.imported %>% filter(genes == "ENSMUSG00000100147")
+PvsEearlyTotal.imported %>% filter(genes == "ENSMUSG00000100147")
+
+#lncOL4
+#EBvsSTotal.anno %>% filter(genes == "MSTRG.19061")
+P7BvsSTotal.anno %>% filter(genes == "MSTRG.19061")
+BvsSearlyTotal.anno %>% filter(genes == "MSTRG.19061")
+BP7vsETotal.anno %>% filter(genes == "MSTRG.19061")
+SP7vsETotal.anno %>% filter(genes == "MSTRG.19061")
+PvsEearlyTotal.anno %>% filter(genes == "MSTRG.19061")
+
+```
+
+
+```{r ExportToXLS}
+listofobjectstoxls(characterlistofobjectnames = c("EBvsS", "P7BvsS", "BvsSearly", "BP7vsE", "SP7vsE", "PvsEearly"), filename = "noveltranscripts.xlsx", suffix = "Total.anno")
+
+
+```
+
+
+
+
+```{r}
+PvsEearlyTotal.imported %>% filter(substr(mgi_symbol, 1, 4) == "Grik")
+```
+
+
+```{r HowManyNovels}
+
+length(unique(novels_classed_coded_clean$gene.y))
+
+```
+
+
+```{r}
+ttoi <- c("lincRNA", "miRNA", "antisense", "processed_transcript", "snoRNA")
+BPvsE_known <- BP7vsETotal.imported %>% 
+  filter(gene_biotype %in% ttoi) %>%
+  filter(abs(logFC) >= 4) %>%
+  arrange( desc(logFC))
+
+SPvsE_known<- SP7vsETotal.imported %>% 
+  filter(gene_biotype %in% ttoi) %>%
+  filter(abs(logFC) >= 4) %>%
+  arrange( desc(logFC))
+
+```
+
+```{r HowManyNovelDETotal}
+tmp <- unique(c(as.vector(EBvsSTotal.anno$genes), as.vector(P7BvsSTotal.anno$genes), as.vector(BvsSearlyTotal.anno$genes), as.vector(BP7vsETotal.anno$genes), as.vector(SP7vsETotal.anno$genes), as.vector(PvsEearlyTotal.anno$genes)))
+
+
+allDEanno <- rbindlist(list(EBvsSTotal.imported, P7BvsSTotal.imported, BvsSearlyTotal.imported, BP7vsETotal.imported, SP7vsETotal.imported, PvsEearlyTotal.imported) ,idcol=TRUE)
+
+names(allDEanno) <- c("comparison", "genes", "logFC", "AveExpr", "t", "P.Value", "adj.P.Val", "B", "mgi_symbol", "description", "gene_biotype")
+
+trans <- c("EBvsS","PBvsS","BvsS","BPvsE","SPvsE", "PvsE")
+names(trans) <- c(1,2,3,4,5,6)
+
+allDEanno$comparison <- trans[ as.character(allDEanno$comparison) ]
+rm(trans)
+
+
+allDEanno %>%   select(gene_biotype) %>% distinct()
+
+allDEanno %>%   filter(gene_biotype %in% c("lincRNA", "miRNA", "antisense", "processed_transcript", "snRNA", "snoRNA", "rRNA", "bidirectional_promoter_lncrna"))%>% select(genes) %>% distinct()
+
+# now same for novels
+allDEnovel <- rbindlist(list(EBvsSTotal, P7BvsSTotal, BvsSearlyTotal, BP7vsETotal, SP7vsETotal, PvsEearlyTotal) ,idcol=TRUE)
+names(allDEnovel) <- c("comparison", "genes", "logFC", "AveExpr", "t", "P.Value", "adj.P.Val", "B")
+trans <- c("EBvsS","PBvsS","BvsS","BPvsE","SPvsE", "PvsE")
+names(trans) <- c(1,2,3,4,5,6)
+allDEnovel$comparison <- trans[ as.character(allDEnovel$comparison) ]
+rm(trans)
+
+
+```
+
+
+```{r Volcanoes}
+# For volcano
+EBvsSTotal.all <- topTable(fit2Total,  adjust="BH",lfc=0,p.value=1, number=Inf, sort="logFC",coef="EBvsS")
+P7BvsSTotal.all <- topTable(fit2Total,  adjust="BH",lfc=0,p.value=1, number=Inf, sort="logFC",coef="P7BvsS")
+BvsSearlyTotal.all <- topTable(fit2Total,  adjust="BH",lfc=0,p.value=1, number=Inf, sort="logFC",coef="BvsSearly")
+BP7vsETotal.all <- topTable(fit2Total,  adjust="BH",lfc=0,p.value=1,number=Inf, sort="logFC",coef="BP7vsE")
+SP7vsETotal.all <- topTable(fit2Total,  adjust="BH",lfc=0,p.value=1, number=Inf, sort="logFC",coef="SP7vsE")
+PvsEearlyTotal.all <- topTable(fit2Total,  adjust="BH",lfc=0,p.value=1, number=Inf, sort="logFC",coef="PvsEearly")
+
+annotation <- read.csv("../160923_DGEAgo/annotationBiomart.txt")
+
+
+allNCrnaAnno <- annotation %>%   filter(Gene.type %in% c("lincRNA", "miRNA", "antisense", "processed_transcript", "snRNA", "snoRNA", "rRNA", "bidirectional_promoter_lncrna")) %>% select(Ensembl.Gene.ID) %>% distinct()
+
+
+# PvsE
+pdf("PvsE.volcano.pdf", width = 210, height = 297, units = "mm")
+  
+PvsEearlyTotal.all.anno <- PvsEearlyTotal.all %>% filter(genes %in% as.character(allNCrnaAnno$Ensembl.Gene.ID))
+PvsEearlyTotal.all.novel <- PvsEearlyTotal.all %>% filter(substr(genes, 1, 5) == "MSTRG" )
+
+PvsEearlyTotal.all.nc <- rbind(PvsEearlyTotal.all.anno, PvsEearlyTotal.all.novel)
+
+
+PvsEearlyTotal.all.nc$threshold <- as.factor(PvsEearlyTotal.all.nc$genes %in% union(PvsEearlyTotal.imported$genes, PvsEearlyTotal.anno$genes))
+
+tmp <- PvsEearlyTotal.imported %>% filter(gene_biotype %in% c("lincRNA", "miRNA", "antisense", "processed_transcript", "snRNA", "snoRNA", "rRNA", "bidirectional_promoter_lncrna"))
+
+# genes to highlight
+PvsEearlyTotal.imported %>%
+  filter(genes %in% as.character(allNCrnaAnno$Ensembl.Gene.ID)) %>%
+  filter(mgi_symbol %in% c("H19", "Rmst", "1700047M11Rik", "Lhx1os", "Mirlet7a-2", "Lincpint" )) %>%
+  select(genes, mgi_symbol) 
+
+
+# lncOL2 ENSMUSG00000097736, 
+# lncOL3 ENSMUSG00000100147
+
+# lncOL1 MSTRG.11787
+
+# Now do the plotting
+
+pdf("PvsE.nc.volcano.pdf", width = 8.26772, height = 11.6929)
+
+baseplot_PvsEearlyTotal <- ggplot(PvsEearlyTotal.all.nc, aes(x = logFC,y = -log10(adj.P.Val), colour = threshold)) + theme_bw() + geom_point(alpha = 1, size=1) + theme(legend.position = "none") + xlab("log-fold change") + ylab("-log10(padj)") + theme(axis.text.x=element_text(size=18)) + theme(axis.text.y=element_text(size=18))+ theme(axis.title.x=element_text(size=18)) + theme(axis.title.y=element_text(size=18)) + coord_cartesian(xlim = c(-12, 12), ylim=c(-0.5, 8.5)) + geom_point(x = subset.data.frame(PvsEearlyTotal.all.nc, PvsEearlyTotal.all.nc$genes == "MSTRG.11787")$logFC, y = -log10(subset.data.frame(PvsEearlyTotal.all.nc, PvsEearlyTotal.all.nc$genes == "MSTRG.11787")$adj.P.Val), colour = "black", shape = 1, size = 2) + geom_text(x = subset.data.frame(PvsEearlyTotal.all.nc, PvsEearlyTotal.all.nc$genes == "MSTRG.11787")$logFC+1.2, y = -log10(subset.data.frame(PvsEearlyTotal.all.nc, PvsEearlyTotal.all.nc$genes == "MSTRG.11787")$adj.P.Val )-0.2, label = "lncOL1", size = 6,family = "Helvetica", colour = "black") + geom_point(x = subset.data.frame(PvsEearlyTotal.all.nc, PvsEearlyTotal.all.nc$genes == "ENSMUSG00000100147")$logFC, y = -log10(subset.data.frame(PvsEearlyTotal.all.nc, PvsEearlyTotal.all.nc$genes == "ENSMUSG00000100147")$adj.P.Val), colour = "black", shape = 1, size = 2) + geom_text(x = subset.data.frame(PvsEearlyTotal.all.nc, PvsEearlyTotal.all.nc$genes == "ENSMUSG00000100147")$logFC+1.5, y = -log10(subset.data.frame(PvsEearlyTotal.all.nc, PvsEearlyTotal.all.nc$genes == "ENSMUSG00000100147")$adj.P.Val), label = "lncOL3", size = 6,family = "Helvetica", colour = "black")
+
+
+
+baseplot_PvsEearlyTotal2 <- baseplot_PvsEearlyTotal  + geom_point(x = subset.data.frame(PvsEearlyTotal.all.nc, PvsEearlyTotal.all.nc$genes == "ENSMUSG00000097736")$logFC, y = -log10(subset.data.frame(PvsEearlyTotal.all.nc, PvsEearlyTotal.all.nc$genes == "ENSMUSG00000097736")$adj.P.Val), colour = "black", shape = 1, size = 2) + geom_text(x = subset.data.frame(PvsEearlyTotal.all.nc, PvsEearlyTotal.all.nc$genes == "ENSMUSG00000097736")$logFC-1.4, y = -log10(subset.data.frame(PvsEearlyTotal.all.nc, PvsEearlyTotal.all.nc$genes == "ENSMUSG00000097736")$adj.P.Val), label = "lncOL2", size = 6,family = "Helvetica", colour = "black") + geom_point(x = subset.data.frame(PvsEearlyTotal.all.nc, PvsEearlyTotal.all.nc$genes == "ENSMUSG00000092770")$logFC, y = -log10(subset.data.frame(PvsEearlyTotal.all.nc, PvsEearlyTotal.all.nc$genes == "ENSMUSG00000092770")$adj.P.Val), colour = "black", shape = 1, size = 2) + geom_text(x = subset.data.frame(PvsEearlyTotal.all.nc, PvsEearlyTotal.all.nc$genes == "ENSMUSG00000092770")$logFC-2.5, y = -log10(subset.data.frame(PvsEearlyTotal.all.nc, PvsEearlyTotal.all.nc$genes == "ENSMUSG00000092770")$adj.P.Val), label = "Mirlet7a-2", size = 6,family = "Helvetica", colour = "black")
+
+
+baseplot_PvsEearlyTotal3 <- baseplot_PvsEearlyTotal2  + geom_point(x = subset.data.frame(PvsEearlyTotal.all.nc, PvsEearlyTotal.all.nc$genes == "ENSMUSG00000087211")$logFC, y = -log10(subset.data.frame(PvsEearlyTotal.all.nc, PvsEearlyTotal.all.nc$genes == "ENSMUSG00000087211")$adj.P.Val), colour = "black", shape = 1, size = 2) + geom_text(x = subset.data.frame(PvsEearlyTotal.all.nc, PvsEearlyTotal.all.nc$genes == "ENSMUSG00000087211")$logFC-1.5, y = -log10(subset.data.frame(PvsEearlyTotal.all.nc, PvsEearlyTotal.all.nc$genes == "ENSMUSG00000087211")$adj.P.Val), label = "Lhx1os", size = 6,family = "Helvetica", colour = "black") + geom_point(x = subset.data.frame(PvsEearlyTotal.all.nc, PvsEearlyTotal.all.nc$genes == "ENSMUSG00000097348")$logFC, y = -log10(subset.data.frame(PvsEearlyTotal.all.nc, PvsEearlyTotal.all.nc$genes == "ENSMUSG00000097348")$adj.P.Val), colour = "black", shape = 1, size = 2) + geom_text(x = subset.data.frame(PvsEearlyTotal.all.nc, PvsEearlyTotal.all.nc$genes == "ENSMUSG00000097348")$logFC-1.2, y = -log10(subset.data.frame(PvsEearlyTotal.all.nc, PvsEearlyTotal.all.nc$genes == "ENSMUSG00000097348")$adj.P.Val), label = "Rmst", size = 6,family = "Helvetica", colour = "black") + geom_point(x = subset.data.frame(PvsEearlyTotal.all.nc, PvsEearlyTotal.all.nc$genes == "ENSMUSG00000044471")$logFC, y = -log10(subset.data.frame(PvsEearlyTotal.all.nc, PvsEearlyTotal.all.nc$genes == "ENSMUSG00000044471")$adj.P.Val), colour = "black", shape = 1, size = 2) + geom_text(x = subset.data.frame(PvsEearlyTotal.all.nc, PvsEearlyTotal.all.nc$genes == "ENSMUSG00000044471")$logFC+1.5, y = -log10(subset.data.frame(PvsEearlyTotal.all.nc, PvsEearlyTotal.all.nc$genes == "ENSMUSG00000044471")$adj.P.Val), label = "Lincpint", size = 6,family = "Helvetica", colour = "black") + geom_point(x = subset.data.frame(PvsEearlyTotal.all.nc, PvsEearlyTotal.all.nc$genes == "ENSMUSG00000000031")$logFC + 0.1, y = -log10(subset.data.frame(PvsEearlyTotal.all.nc, PvsEearlyTotal.all.nc$genes == "ENSMUSG00000000031")$adj.P.Val), colour = "black", shape = 1, size = 2) + geom_text(x = subset.data.frame(PvsEearlyTotal.all.nc, PvsEearlyTotal.all.nc$genes == "ENSMUSG00000000031")$logFC-1, y = -log10(subset.data.frame(PvsEearlyTotal.all.nc, PvsEearlyTotal.all.nc$genes == "ENSMUSG00000000031")$adj.P.Val), label = "H19", size = 6,family = "Helvetica", colour = "black") 	
+
+
+baseplot_PvsEearlyTotal3
+dev.off()
+```
+
+```{r LoadDavidsAnalysis}
+davidtranscripts <- NULL
+filePaths <- list.files(path="/Users/darya/Dropbox/SUELI_DARYA BULK SEQ/David_singlecell/Markers/NcRNAMarkers",pattern="\\.txt$",include.dirs=TRUE, full.names = TRUE)
+for(filePath in filePaths){
+  currentDF <- read.table(filePath, skip = 1, header = FALSE)
+  currentDF$V1 <- NULL
+  currentDF$CellType <- substr(filePath, nchar("/Users/darya/Dropbox/SUELI_DARYA BULK SEQ/David_singlecell/Markers/NcRNAMarkers/")+1, nchar(filePath) - 4)
+  davidtranscripts <- rbind(davidtranscripts, currentDF)
+  rm(currentDF)
+}
+names(davidtranscripts) <-  c("Gene", "CellType")
+table(davidtranscripts$CellType)
+table(davidtranscripts$Gene)
+```
+
+```{r AnnoDavidAndFilter}
+davidtranscripts.anno <- merge.data.frame(davidtranscripts, annotation, by.x = "Gene", by.y="MGI.symbol", all.x = TRUE)
+table(davidtranscripts.anno$Gene.type)
+
+davidtranscripts.anno <- subset.data.frame(davidtranscripts.anno, davidtranscripts.anno$Gene.type != "protein_coding")
+davidtranscripts.novel <- subset.data.frame(davidtranscripts, substr(davidtranscripts$Gene,1,2) == "MS")
+davidtranscripts.novel.edited <- davidtranscripts.novel[davidtranscripts.novel$Gene %ni% novels_classed_coded_clean$gene.y,]
+davidtranscripts.novel <- davidtranscripts.novel[davidtranscripts.novel$Gene %in% novels_classed_coded_clean$gene.y,]
+
+davidtranscripts.novel.edited <- data.frame(lapply(davidtranscripts.novel.edited, function(x) {gsub("_loc1", "", x)}))
+davidtranscripts.novel.edited <- data.frame(lapply(davidtranscripts.novel.edited, function(x) {gsub("_loc2", "", x)}))
+davidtranscripts.novel.edited <- data.frame(lapply(davidtranscripts.novel.edited, function(x) {gsub("_loc3", "", x)}))
+davidtranscripts.novel.edited <- data.frame(lapply(davidtranscripts.novel.edited, function(x) {gsub("_loc4", "", x)}))
+davidtranscripts.novel.edited <- data.frame(lapply(davidtranscripts.novel.edited, function(x) {gsub("_loc5", "", x)}))
+table(davidtranscripts.novel.edited$Gene %in% novels_classed_coded_clean$gene.y)
+davidtranscripts.novel.edited[davidtranscripts.novel.edited$Gene %ni% novels_classed_coded_clean$gene.y,]
+davidtranscripts.novel.edited <- davidtranscripts.novel.edited[davidtranscripts.novel.edited$Gene %in% novels_classed_coded_clean$gene.y,]
+davidtranscripts.novel <- rbind(davidtranscripts.novel, davidtranscripts.novel.edited)
+rm(davidtranscripts.novel.edited)
+davidtranscripts.novel.anno <- merge.data.frame(davidtranscripts.novel, novels_classed_coded_clean, by.x= "Gene", by.y = "gene.y")
+```
+MSTRG.14413 is specific to NP2 and NPs, while MSTRG.14415 is specific for NP3s. These two just seem like longer extensions of the 5' UTR of Robo1. 
+
+```{r makeCodersLookLikeCoders}
+davidtranscripts.novel.anno.coders <- subset.data.frame(davidtranscripts.novel.anno, davidtranscripts.novel.anno$class == "mRNA")
+
+davidtranscripts.novel.anno.stillnc <- subset.data.frame(davidtranscripts.novel.anno, davidtranscripts.novel.anno$Gene %ni% davidtranscripts.novel.anno.coders$Gene)
+```
+
+```{r OverlapWithBulk}
+davidtranscripts.anno.bulk <- merge.data.frame(davidtranscripts.anno, allDEanno, by.x="Ensembl.Gene.ID", by.y="genes", all.x = TRUE)
+
+davidtranscripts.novel.anno.coders.bulk <- merge.data.frame(davidtranscripts.novel.anno.coders, allDEnovel, by.x="Gene", by.y="genes", all.x = TRUE)
+
+
+davidtranscripts.novel.anno.stillnc.bulk <- merge.data.frame(davidtranscripts.novel.anno.stillnc, allDEnovel, by.x="Gene", by.y="genes", all.x = TRUE)
+
+```
+
+
+```{r ExportToShare}
+listofobjectstoxls(c("anno", "anno.bulk", "novel.anno.coders","novel.anno.coders.bulk", "novel.anno.stillnc","novel.anno.stillnc.bulk"), filename = "singleCellNovelTranscriptsAfterDavid.xlsx", suffix = "", prefix = "davidtranscripts.")
+```
+
+LncOL1 is Pcdh17it
+
+```{r ForNcNovelHeatmap}
+heatmapKnowns <- c("Mir219a-2", "Mir124a-1hg", "Mir124-2hg", "H19", "Dnm3os", "Airn", "Dlx1as", "Lhx1os", "Dlx6os1", "Rmst", "1700047M11Rik", "1700086L19Rik", "2610035F20Rik", "9530059O14Rik", "C630043F03Rik")
+heatmapKnownsENS <- as.character(subset.data.frame(annotation, annotation$MGI.symbol %in% heatmapKnowns, select = c( "Ensembl.Gene.ID"))$Ensembl.Gene.ID)
+
+heatmapAll <- c(heatmapKnownsENS, c("MSTRG.38021", "MSTRG.27163", "MSTRG.37353", "MSTRG.29632", "MSTRG.8551", "MSTRG.11787"))
+
+# Remember to replace with Pcdh17it
+
+cpmTotal <- as.data.frame(cpmTotal)
+cpmTotal$Row.names <- row.names(cpmTotal)
+genesForHeatmap <- subset.data.frame(cpmTotal, cpmTotal$Row.names %in% heatmapAll)
+genesForHeatmap <- merge.data.frame(genesForHeatmap, annotation, by.x="Row.names", by.y="Ensembl.Gene.ID", all.x=TRUE)
+
+genesForHeatmapTmp2 <- subset.data.frame(genesForHeatmap, !is.na(genesForHeatmap$MGI.symbol ))
+genesForHeatmapTmp <- subset.data.frame(genesForHeatmap, is.na(genesForHeatmap$MGI.symbol ))
+genesForHeatmapTmp$MGI.symbol <- genesForHeatmapTmp$Row.names
+genesForHeatmap <- rbind.data.frame(genesForHeatmapTmp2,genesForHeatmapTmp)
+rm(genesForHeatmapTmp, genesForHeatmapTmp2)
+
+# remove duplicate zero count DLx6os1
+genesForHeatmap <- genesForHeatmap %>% filter(Row.names != "ENSMUSG00000098326")
+
+rownames(genesForHeatmap) <- genesForHeatmap$MGI.symbol
+
+heatmap3(genesForHeatmap[,2:13], Rowv = TRUE, Colv=TRUE, method="complete", ColSideCut = 0.05,ColSideWidth=0.8, col= colorRampPalette(c("#2c7bb6", "#ffffbf", "#d7191c"))(1024),distfun = function(x) as.dist(1 - cor(t(x), method = "spearman", use = "pa")), balanceColor = TRUE)
+```
+
+
+
+

@@ -1,0 +1,1310 @@
+---
+title: "OPC DGEA and GO"
+author: "Darya Vanichkina"
+date: "6/29/2016"
+output: html_document
+---
+
+```{r LoadLibraries}
+#source("~/.Rprofile")
+library(ggplot2)
+library(edgeR)
+library(biomaRt)
+library(limma)
+require(gridExtra)
+library(DESeq2)
+library(gplots)
+library(reshape2)
+library(RColorBrewer)
+library(plyr)
+library(genefilter)
+library(gplots)
+library(data.table) # properly working with big data frames
+library(openxlsx) # exporting to excel
+library(roxygen2) # for proper documentation
+library(magrittr) # for proper variable to name and name to variable deparsing
+library(geneplotter) #multidensity
+library(topGO)
+library(org.Mm.eg.db)
+#library("VennDiagram")
+library(EDASeq)
+
+round_df <- function(df, digits) {
+  nums <- vapply(df, is.numeric, FUN.VALUE = logical(1))
+  df[,nums] <- round(df[,nums], digits = digits)
+  (df)
+}
+
+
+GetGeneDirection <- function(gene, mydataframe, ... ){
+ifelse(gene %in% subset.data.frame(mydataframe, mydataframe$logFC >0)$genes,
+       1,
+       ifelse(gene %in% subset.data.frame(mydataframe, mydataframe$logFC <0)$genes,
+              -1,
+              0))
+}
+
+
+
+
+
+writeoutgenelist <- function(comparisonslist, filename , suffix = ""){
+tmpworkbookname <- createWorkbook()
+for (comparison in comparisonslist) {
+  # str(eval(as.name(paste0(comparison, ".anno"))))
+  addWorksheet(wb = tmpworkbookname, sheetName = comparison, gridLines = FALSE)
+  writeData(wb = tmpworkbookname, sheet = comparison, x = eval(as.name(paste0(comparison, paste0(suffix, ".anno")))), borders = "none")
+  rm(comparison)
+}
+saveWorkbook(tmpworkbookname, file = filename, overwrite = TRUE)
+rm(tmpworkbookname)
+
+}
+
+
+listofobjectstoxls <- function(characterlistofobjectnames, filename = "outputworksheet", suffix = ""){
+  # Test that all objects exist
+  for (object in paste0(characterlistofobjectnames, suffix, sep = "")) {
+    if (exists(object) == FALSE) {
+        stop(paste0(paste0("The object ", object), " does not exist! Please edit your input list before continuing."))
+      }
+  }
+
+  tmpworkbookname <- createWorkbook()
+    for (object in characterlistofobjectnames) {
+        addWorksheet(wb = tmpworkbookname, sheetName = object, gridLines = FALSE)
+        writeData(wb = tmpworkbookname, sheet = object, x = eval(as.name(paste0(object, suffix))), borders = "none")
+    }
+  saveWorkbook(tmpworkbookname, file = filename, overwrite = TRUE)
+  rm(tmpworkbookname, object)
+}
+
+
+
+listofDataTablestoxls <- function(characterlistofobjectnames, filename = "outputworksheet", suffix = ""){
+  # Test that all objects exist
+  for (object in characterlistofobjectnames) {
+    if (exists(object) == FALSE) {
+        stop(paste0(paste0("The object ", object), " does not exist! Please edit your input list before continuing."))
+      }
+  }
+
+  tmpworkbookname <- createWorkbook()
+    for (object in characterlistofobjectnames) {
+        addWorksheet(wb = tmpworkbookname, sheetName = object, gridLines = FALSE)
+        writeData(wb = tmpworkbookname, sheet = object, x = as.data.frame(eval(as.name(paste0(object, suffix)))), borders = "none")
+  }
+  saveWorkbook(tmpworkbookname, file = filename, overwrite = TRUE)
+  rm(tmpworkbookname, object)
+}
+
+
+```
+
+```{r ReadData, cache=TRUE, echo=FALSE}
+# Import the data ----
+setwd("../counttables_OPC/")
+file_list <- list.files(".",pattern = "\\multicounts.txt$")
+counttableComplete <- do.call("cbind",lapply(file_list,FUN=function(files){read.table(files,header=FALSE, skip=2,colClasses = c("character", rep("NULL", 4), "numeric", "numeric"),  sep="\t", col.names=c("Gene",rep("nothing", 4), "length", files))}))
+row.names(counttableComplete) <- substr(counttableComplete$Gene,1,18)
+for (i in 1:(ncol(counttableComplete)/3)) {counttableComplete$Gene <- NULL}
+counttableCompleteLen <- subset.data.frame(counttableComplete, select="length")
+for (i in 1:(ncol(counttableComplete)/2)) {counttableComplete$length <- NULL}
+
+counttableCompleteLen.vector <- as.numeric(counttableCompleteLen[,"length"])
+names(counttableCompleteLen.vector) <- row.names(counttableCompleteLen)
+
+names(counttableComplete) <- substr(names(counttableComplete), 1, nchar(names(counttableComplete))-16)
+rm(file_list,i)
+setwd("../")
+
+
+counttableComplete_tmp <-round_df(counttableComplete, digits=1)
+counttableComplete_tmp2 <- data.frame(apply(counttableComplete_tmp, 2, function(x) as.integer(x)))
+row.names(counttableComplete_tmp2) <- row.names(counttableComplete)
+counttableComplete <- counttableComplete_tmp2
+rm(counttableComplete_tmp2, counttableComplete_tmp)
+counttable <- counttableComplete
+rm(counttableComplete)
+
+# Get an annotation ------
+#For now:
+annotation <- read.csv("annotationBiomart.txt")
+names(annotation) <- c("ensembl_gene_id","mgi_symbol", "description", "gene_biotype")
+counttableAnno <- merge.data.frame(counttable, annotation, by.x=0, by.y="ensembl_gene_id")
+
+# ensembl=useMart(host="www.ensembl.org", biomart="ENSEMBL_MART_ENSEMBL", dataset = "mmusculus_gene_ensembl")
+# annotation <- getBM(attributes=c("ensembl_gene_id","mgi_symbol", "description", "gene_biotype"), filters = "ensembl_gene_id", values=row.names(counttable), mart=ensembl)
+
+genenameslist <- annotation$mgi_symbol
+names(genenameslist) <- annotation$ensembl_gene_id
+```
+
+The gencode annotation M8 which we are using corresponds to ensembl 83, which is Dec 2015 hosted. Since we've got novel transcripts in here, make sure to not lose them because they are unannotated.
+
+
+```{r LimmaTotal}
+
+
+counttableTotal <- counttable[,c("E13.5B1", "E13.5B2", "E13.5B3", "E13.5S1", "E13.5S2", "E13.5S3", "P7B1", "P7B2", "P7B3", "P7S1", "P7S2", "P7S3")]
+
+groupsTotal <- substr(names(counttableTotal),1, nchar(names(counttableTotal)) - 1 )
+groups.df.Total <- data.frame(groupsTotal)
+groups.df.Total$sample <- names(counttableTotal)
+groups.df.Total$stage <- as.factor(substr(groupsTotal, 1, nchar(groupsTotal)-1))
+groups.df.Total$region <- as.factor(substr(groupsTotal, nchar(groupsTotal), nchar(groupsTotal)))
+groups.df.Total$stage <- relevel(groups.df.Total$stage, ref="E13.5")
+rm(groupsTotal)
+
+designTotal <- model.matrix(~ 0 + groupsTotal, data=groups.df.Total)
+designTotal
+colnames(designTotal) <- levels(groups.df.Total$groupsTotal)
+
+yTotal <- DGEList(counts=counttableTotal, genes=row.names(counttableTotal))
+yTotalunfiltered <- yTotal
+isexprTotal <- rowSums(cpm(yTotal)>0.7) >= 3
+limmatestedTotal <- as.vector((yTotal$genes))
+yTotal <- yTotal[isexprTotal,]
+dim(yTotal)
+yTotal$samples$lib.size <- colSums(yTotal$counts)
+yTotal <- calcNormFactors(yTotal)
+vTotal <- voom(yTotal,designTotal,plot=TRUE)
+fitTotal <- lmFit(vTotal,designTotal)
+
+yTotalunfiltered <- calcNormFactors(yTotalunfiltered)
+cpmTotal <- cpm(yTotalunfiltered)
+
+contrast.matrixTotal <- makeContrasts(EBvsS=E13.5B-E13.5S,
+                                 P7BvsS=P7B-P7S,
+                                 BvsSearly=0.5*(E13.5B+P7B)-0.5*(E13.5S+P7S),
+                                 BP7vsE=P7B-E13.5B,
+                                 SP7vsE=P7S-E13.5S,
+                                 PvsEearly=0.5*(P7B+P7S)-0.5*(E13.5B+E13.5S),
+                                 levels=designTotal)
+
+fit2Total <- contrasts.fit(fitTotal, contrast.matrixTotal)
+fit2Total <- eBayes(fit2Total)
+resultsTotal <- decideTests(fit2Total,p.value=0.05, lfc=1)
+summary(resultsTotal)
+
+EBvsSTotal <- topTable(fit2Total,  adjust="BH",lfc=1,p.value=0.05, number=Inf, sort="logFC",coef="EBvsS")
+P7BvsSTotal <- topTable(fit2Total,  adjust="BH",lfc=1,p.value=0.05, number=Inf, sort="logFC",coef="P7BvsS")
+BvsSearlyTotal <- topTable(fit2Total,  adjust="BH",lfc=1,p.value=0.05, number=Inf, sort="logFC",coef="BvsSearly")
+BP7vsETotal <- topTable(fit2Total,  adjust="BH",lfc=1,p.value=0.05, number=Inf, sort="logFC",coef="BP7vsE")
+SP7vsETotal <- topTable(fit2Total,  adjust="BH",lfc=1,p.value=0.05, number=Inf, sort="logFC",coef="SP7vsE")
+PvsEearlyTotal <- topTable(fit2Total,  adjust="BH",lfc=1,p.value=0.05, number=Inf, sort="logFC",coef="PvsEearly")
+
+# MDS
+par(family = 'Helvetica')
+plotMDS(vTotal, col=c(rep("red",3), rep("deeppink",3), rep("blue", 3), rep("cyan", 3)),gene.selection="pairwise")
+
+plotMDS(vTotal, col=c(rep("red",3), rep("deeppink",3), rep("blue", 3), rep("cyan", 3)),pch=19,gene.selection="common")
+text(-2.5, 1.6,"E13.5B", col="deeppink", font=2)
+text(2.8, 1.6,"P7B", col="cyan", font=2)
+text(-1.9, -1.6,"E13.5S", col="red", font=2)
+text(2, -1.6,"P7S", col="blue", font=2)
+abline(v=0,lty="dotted")
+abline(h=0,lty="dotted")
+
+
+
+
+
+
+```
+
+```{r ForVennDiagram}
+contrast.matrixTotal1 <- makeContrasts(EBvsS=E13.5B-E13.5S,
+                                 P7BvsS=P7B-P7S,
+                                 BvsSearly=0.5*(E13.5B+P7B)-0.5*(E13.5S+P7S),
+                                 levels=designTotal)
+
+fit2Total1 <- contrasts.fit(fitTotal, contrast.matrixTotal1)
+fit2Total1 <- eBayes(fit2Total1)
+resultsTotal1 <- decideTests(fit2Total1,p.value=0.05, lfc=1)
+par(bty = 'n') 
+vennDiagram(resultsTotal1,include=c("up","down"), counts.col = c("red","darkgreen"), bty="n")
+
+
+rm(contrast.matrixTotal1, fit2Total1, resultsTotal1)
+
+
+# Now the second
+contrast.matrixTotal2 <- makeContrasts(BP7vsE=P7B-E13.5B,
+                                 SP7vsE=P7S-E13.5S,
+                                 PvsEearly=0.5*(P7B+P7S)-0.5*(E13.5B+E13.5S),
+                                 levels=designTotal)
+
+fit2Total2 <- contrasts.fit(fitTotal, contrast.matrixTotal2)
+fit2Total2 <- eBayes(fit2Total2)
+resultsTotal2 <- decideTests(fit2Total2,p.value=0.05, lfc=1)
+par(bty = 'n') 
+vennDiagram(resultsTotal2,include=c("up","down"), counts.col = c("red","darkgreen"), bty="n")
+rm(contrast.matrixTotal2, fit2Total2, resultsTotal2)
+
+
+
+
+
+```
+
+
+```{r Volcanoes}
+# For volcano
+EBvsSTotal.all <- topTable(fit2Total,  adjust="BH",lfc=0,p.value=1, number=Inf, sort="logFC",coef="EBvsS")
+P7BvsSTotal.all <- topTable(fit2Total,  adjust="BH",lfc=0,p.value=1, number=Inf, sort="logFC",coef="P7BvsS")
+BvsSearlyTotal.all <- topTable(fit2Total,  adjust="BH",lfc=0,p.value=1, number=Inf, sort="logFC",coef="BvsSearly")
+BP7vsETotal.all <- topTable(fit2Total,  adjust="BH",lfc=0,p.value=1,number=Inf, sort="logFC",coef="BP7vsE")
+SP7vsETotal.all <- topTable(fit2Total,  adjust="BH",lfc=0,p.value=1, number=Inf, sort="logFC",coef="SP7vsE")
+PvsEearlyTotal.all <- topTable(fit2Total,  adjust="BH",lfc=0,p.value=1, number=Inf, sort="logFC",coef="PvsEearly")
+
+
+# BvsSearlyTotal.all
+#pdf("BvsSearlyTotal.volcano.pdf", width = 210, height = 297, units = "mm")
+
+tiff("BvsSearlyTotal.volcano2.tiff", width = 140, height = 148.5, units = "mm", res = 600)
+
+
+BvsSearlyTotal.all$threshold <- as.factor(BvsSearlyTotal.all$genes %in% BvsSearlyTotal.anno$genes)
+
+
+
+
+# Now do the plotting
+# baseplot_BvsSearlyTotal <- ggplot(BvsSearlyTotal.all, aes(x = logFC,y = -log10(adj.P.Val), colour = threshold)) + theme_bw() + geom_point(alpha = 1, size=1) + theme(legend.position = "none") + xlab("log-fold change") + ylab("-log10(padj)") + theme(axis.text.x=element_text(size=18)) + theme(axis.text.y=element_text(size=18))+ theme(axis.title.x=element_text(size=18)) + theme(axis.title.y=element_text(size=18)) + coord_cartesian(xlim = c(-12, 12), ylim=c(-0.5, 8.5)) +  geom_point(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Hoxb6")$logFC, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Hoxb6")$adj.P.Val), colour = "black", shape = 1, size = 2) + geom_text(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Hoxb6")$logFC-1, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Hoxb6")$adj.P.Val), label = "Hoxb6", size = 6,family = "Helvetica", colour = "black")  +  geom_point(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Camk2a")$logFC, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Camk2a")$adj.P.Val), colour = "black", shape = 1, size = 2) + geom_text(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Camk2a")$logFC+1.5, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Camk2a")$adj.P.Val), label = "Camk2a", size = 6,family = "Helvetica", colour = "black")   +  geom_point(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Plp1")$logFC, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Plp1")$adj.P.Val), colour = "black", shape = 1, size = 2) + geom_text(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Plp1")$logFC-1, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Plp1")$adj.P.Val), label = "Plp1", size = 6,family = "Helvetica", colour = "black")   
+# 
+# baseplot_BvsSearlyTotal2 <- baseplot_BvsSearlyTotal +   geom_point(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Foxg1")$logFC, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Foxg1")$adj.P.Val), colour = "black", shape = 1, size = 2) + geom_text(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Foxg1")$logFC-1, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Foxg1")$adj.P.Val), label = "Foxg1", size = 6,family = "Helvetica", colour = "black")  +  geom_point(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Nkx2-1")$logFC, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Nkx2-1")$adj.P.Val), colour = "black", shape = 1, size = 2) + geom_text(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Nkx2-1")$logFC+1.2, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Nkx2-1")$adj.P.Val), label = "Nkx2-1", size = 6,family = "Helvetica", colour = "black")  +  geom_point(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Col19a1")$logFC, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Col19a1")$adj.P.Val), colour = "black", shape = 1, size = 2) + geom_text(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Col19a1")$logFC-1.2, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Col19a1")$adj.P.Val), label = "Col19a1", size = 6,family = "Helvetica", colour = "black")  +  geom_point(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Emx2os")$logFC, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Emx2os")$adj.P.Val), colour = "black", shape = 1, size = 2) + geom_text(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Emx2os")$logFC-1.2, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Emx2os")$adj.P.Val), label = "Emx2os", size = 6,family = "Helvetica", colour = "black")  +  geom_point(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Eomes")$logFC, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Eomes")$adj.P.Val), colour = "black", shape = 1, size = 2) + geom_text(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Eomes")$logFC-1, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Eomes")$adj.P.Val), label = "Eomes", size = 6,family = "Helvetica", colour = "black")  +  geom_point(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Emx2")$logFC, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Emx2")$adj.P.Val), colour = "black", shape = 1, size = 2) + geom_text(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Emx2")$logFC-1, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Emx2")$adj.P.Val), label = "Emx2", size = 6,family = "Helvetica", colour = "black") 
+# 
+# baseplot_BvsSearlyTotal3 <- baseplot_BvsSearlyTotal2 +  geom_point(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Hoxa10")$logFC, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Hoxa10")$adj.P.Val), colour = "black", shape = 1, size = 2) + geom_text(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Hoxa10")$logFC-1.2, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Hoxa10")$adj.P.Val), label = "Hoxa10", size = 6,family = "Helvetica", colour = "black")  +  geom_point(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Slc6a5")$logFC, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Slc6a5")$adj.P.Val), colour = "black", shape = 1, size = 2) + geom_text(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Slc6a5")$logFC-1, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Slc6a5")$adj.P.Val), label = "Slc6a5", size = 6,family = "Helvetica", colour = "black")  +  geom_point(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Hotair")$logFC, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Hotair")$adj.P.Val), colour = "black", shape = 1, size = 2) + geom_text(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Hotair")$logFC-1, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Hotair")$adj.P.Val), label = "Hotair", size = 6,family = "Helvetica", colour = "black")  +  geom_point(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Foxf1")$logFC, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Foxf1")$adj.P.Val), colour = "black", shape = 1, size = 2) + geom_text(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Foxf1")$logFC-1, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Foxf1")$adj.P.Val), label = "Foxf1", size = 6,family = "Helvetica", colour = "black")  +  geom_point(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Opalin")$logFC, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Opalin")$adj.P.Val), colour = "black", shape = 1, size = 2) + geom_text(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Opalin")$logFC-1, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Opalin")$adj.P.Val), label = "Opalin", size = 6,family = "Helvetica", colour = "black")  +  geom_point(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Otx2")$logFC, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Otx2")$adj.P.Val), colour = "black", shape = 1, size = 2) + geom_text(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Otx2")$logFC-1, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Otx2")$adj.P.Val), label = "Otx2", size = 6,family = "Helvetica", colour = "black")
+
+
+#baseplot_BvsSearlyTotal3
+
+
+
+
+
+
+
+
+baseplot_BvsSearlyTotal <- ggplot(BvsSearlyTotal.all, aes(x = logFC,y = -log10(adj.P.Val), colour = threshold)) + theme_bw() + geom_point(alpha = 1, size=1) + theme(legend.position = "none") + xlab("log-fold change") + ylab("-log10(padj)") + theme(axis.text.x=element_blank()) + theme(axis.text.y=element_blank())+ theme(axis.title.x=element_blank()) + theme(axis.title.y=element_blank()) + coord_cartesian(xlim = c(-12, 12), ylim=c(-0.5, 8.5)) +  geom_point(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Hoxb6")$logFC, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Hoxb6")$adj.P.Val), colour = "black", shape = 1, size = 3)  +  geom_point(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Camk2a")$logFC, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Camk2a")$adj.P.Val), colour = "black", shape = 1, size = 3) +  geom_point(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Plp1")$logFC, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Plp1")$adj.P.Val), colour = "black", shape = 1, size = 3)   
+
+baseplot_BvsSearlyTotal2 <- baseplot_BvsSearlyTotal +   geom_point(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Foxg1")$logFC, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Foxg1")$adj.P.Val), colour = "black", shape = 1, size = 3)  +  geom_point(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Nkx2-1")$logFC, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Nkx2-1")$adj.P.Val), colour = "black", shape = 1, size = 3) +  geom_point(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Col19a1")$logFC, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Col19a1")$adj.P.Val), colour = "black", shape = 1, size = 3)  +  geom_point(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Emx2os")$logFC, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Emx2os")$adj.P.Val), colour = "black", shape = 1, size = 3)  +  geom_point(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Eomes")$logFC, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Eomes")$adj.P.Val), colour = "black", shape = 1, size = 3)  +  geom_point(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Emx2")$logFC, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Emx2")$adj.P.Val), colour = "black", shape = 1, size = 3) 
+
+baseplot_BvsSearlyTotal3 <- baseplot_BvsSearlyTotal2 +  geom_point(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Hoxa10")$logFC, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Hoxa10")$adj.P.Val), colour = "black", shape = 1, size = 3)   +  geom_point(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Slc6a5")$logFC, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Slc6a5")$adj.P.Val), colour = "black", shape = 1, size = 3)  +  geom_point(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Hotair")$logFC, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Hotair")$adj.P.Val), colour = "black", shape = 1, size = 3)  +  geom_point(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Foxf1")$logFC, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Foxf1")$adj.P.Val), colour = "black", shape = 1, size = 3)  +  geom_point(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Opalin")$logFC, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Opalin")$adj.P.Val), colour = "black", shape = 1, size = 3)  +  geom_point(x = subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Otx2")$logFC, y = -log10(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$mgi_symbol == "Otx2")$adj.P.Val), colour = "black", shape = 1, size = 3) 
+
+
+baseplot_BvsSearlyTotal3
+
+
+
+
+dev.off()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# PvsEearlyTotal.all
+PvsEearlyTotal.all$threshold <- as.factor(PvsEearlyTotal.all$genes %in% PvsEearlyTotal.anno$genes)
+
+# Now do the plotting
+# baseplot_PvsEearlyTotal <- ggplot(PvsEearlyTotal.all, aes(x = logFC,y = -log10(adj.P.Val), colour = threshold)) + theme_bw() + geom_point(alpha = 1, size=1) + theme(legend.position = "none") + xlab("log-fold change") + ylab("-log10(padj)") + theme(axis.text.x=element_text(size=18)) + theme(axis.text.y=element_text(size=18))+ theme(axis.title.x=element_text(size=18)) + theme(axis.title.y=element_text(size=18)) + coord_cartesian(xlim = c(-12, 12), ylim=c(-0.5, 13)) +  geom_point(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Sox8")$logFC, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Sox8")$adj.P.Val), colour = "black", shape = 1, size = 2) + geom_text(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Sox8")$logFC-1, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Sox8")$adj.P.Val), label = "Sox8", size = 6,family = "Helvetica", colour = "black") 	+  geom_point(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Slc1a1")$logFC, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Slc1a1")$adj.P.Val), colour = "black", shape = 1, size = 2) + geom_text(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Slc1a1")$logFC+1.5, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Slc1a1")$adj.P.Val), label = "Slc1a1", size = 6,family = "Helvetica", colour = "black")
+# 
+# 
+#  baseplot_PvsEearlyTotal2 <- baseplot_PvsEearlyTotal+  geom_point(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Nhlh2")$logFC, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Nhlh2")$adj.P.Val), colour = "black", shape = 1, size = 2) + geom_text(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Nhlh2")$logFC-1, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Nhlh2")$adj.P.Val), label = "Nhlh2", size = 6,family = "Helvetica", colour = "black")   +  geom_point(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Isl1")$logFC, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Isl1")$adj.P.Val), colour = "black", shape = 1, size = 2) + geom_text(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Isl1")$logFC-1, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Isl1")$adj.P.Val), label = "Isl1", size = 6,family = "Helvetica", colour = "black")   +  geom_point(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Lhx1")$logFC, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Lhx1")$adj.P.Val), colour = "black", shape = 1, size = 2) + geom_text(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Lhx1")$logFC-.8, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Lhx1")$adj.P.Val)-.3, label = "Lhx1", size = 6,family = "Helvetica", colour = "black")   +  geom_point(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Neurod6")$logFC, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Neurod6")$adj.P.Val), colour = "black", shape = 1, size = 2) + geom_text(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Neurod6")$logFC-1.5, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Neurod6")$adj.P.Val), label = "Neurod6", size = 6,family = "Helvetica", colour = "black")   +  geom_point(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Olig3")$logFC, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Olig3")$adj.P.Val), colour = "black", shape = 1, size = 2) + geom_text(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Olig3")$logFC-1, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Olig3")$adj.P.Val) +.5, label = "Olig3", size = 6,family = "Helvetica", colour = "black")   +  geom_point(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Th")$logFC, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Th")$adj.P.Val), colour = "black", shape = 1, size = 2) + geom_text(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Th")$logFC+.5, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Th")$adj.P.Val), label = "Th", size = 6,family = "Helvetica", colour = "black")   +  geom_point(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Mobp")$logFC, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Mobp")$adj.P.Val), colour = "black", shape = 1, size = 2) + geom_text(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Mobp")$logFC-1, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Mobp")$adj.P.Val), label = "Mobp", size = 6,family = "Helvetica", colour = "black")
+# 
+#  baseplot_PvsEearlyTotal3 <- baseplot_PvsEearlyTotal2+  geom_point(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Neu4")$logFC, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Neu4")$adj.P.Val), colour = "black", shape = 1, size = 2) + geom_text(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Neu4")$logFC-1, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Neu4")$adj.P.Val), label = "Neu4", size = 6,family = "Helvetica", colour = "black")   +  geom_point(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Mag")$logFC, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Mag")$adj.P.Val), colour = "black", shape = 1, size = 2) + geom_text(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Mag")$logFC-1, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Mag")$adj.P.Val), label = "Mag", size = 6,family = "Helvetica", colour = "black")   +  geom_point(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Mog")$logFC, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Mog")$adj.P.Val), colour = "black", shape = 1, size = 2) + geom_text(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Mog")$logFC-1, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Mog")$adj.P.Val), label = "Mog", size = 6,family = "Helvetica", colour = "black")   +  geom_point(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Plp1")$logFC, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Plp1")$adj.P.Val), colour = "black", shape = 1, size = 2) + geom_text(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Plp1")$logFC-1, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Plp1")$adj.P.Val), label = "Plp1", size = 6,family = "Helvetica", colour = "black")   +  geom_point(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Mbp")$logFC, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Mbp")$adj.P.Val), colour = "black", shape = 1, size = 2) + geom_text(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Mbp")$logFC-1, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Mbp")$adj.P.Val), label = "Mbp", size = 6,family = "Helvetica", colour = "black")   +  geom_point(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Casr")$logFC, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Casr")$adj.P.Val), colour = "black", shape = 1, size = 2) + geom_text(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Casr")$logFC-1, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Casr")$adj.P.Val), label = "Casr", size = 6,family = "Helvetica", colour = "black")
+# 
+#  baseplot_PvsEearlyTotal3
+
+tiff("PvsE.volcano2.tiff", width = 140, height = 148.5, units = "mm", res = 600)
+
+baseplot_PvsEearlyTotal <- ggplot(PvsEearlyTotal.all, aes(x = logFC,y = -log10(adj.P.Val), colour = threshold)) + theme_bw() + geom_point(alpha = 1, size=1) + theme(legend.position = "none") + xlab("log-fold change") + ylab("-log10(padj)") + theme(axis.text.x=element_blank()) + theme(axis.text.y=element_blank())+ theme(axis.title.x=element_blank()) + theme(axis.title.y=element_blank()) + coord_cartesian(xlim = c(-12, 12), ylim=c(-0.5, 13)) +  geom_point(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Sox8")$logFC, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Sox8")$adj.P.Val), colour = "black", shape = 1, size = 2) 	+  geom_point(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Slc1a1")$logFC, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Slc1a1")$adj.P.Val), colour = "black", shape = 1, size = 2)  
+
+
+ baseplot_PvsEearlyTotal2 <- baseplot_PvsEearlyTotal+  geom_point(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Nhlh2")$logFC, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Nhlh2")$adj.P.Val), colour = "black", shape = 1, size = 2)   +  geom_point(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Isl1")$logFC, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Isl1")$adj.P.Val), colour = "black", shape = 1, size = 2)   +  geom_point(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Lhx1")$logFC, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Lhx1")$adj.P.Val), colour = "black", shape = 1, size = 2)  +  geom_point(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Neurod6")$logFC, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Neurod6")$adj.P.Val), colour = "black", shape = 1, size = 2) +  geom_point(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Olig3")$logFC, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Olig3")$adj.P.Val), colour = "black", shape = 1, size = 2)  +  geom_point(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Th")$logFC, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Th")$adj.P.Val), colour = "black", shape = 1, size = 2) +  geom_point(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Mobp")$logFC, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Mobp")$adj.P.Val), colour = "black", shape = 1, size = 2)   
+ 
+ baseplot_PvsEearlyTotal3 <- baseplot_PvsEearlyTotal2+  geom_point(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Neu4")$logFC, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Neu4")$adj.P.Val), colour = "black", shape = 1, size = 2)   +  geom_point(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Mag")$logFC, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Mag")$adj.P.Val), colour = "black", shape = 1, size = 2)   +  geom_point(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Mog")$logFC, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Mog")$adj.P.Val), colour = "black", shape = 1, size = 2)   +  geom_point(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Plp1")$logFC, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Plp1")$adj.P.Val), colour = "black", shape = 1, size = 2)   +  geom_point(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Mbp")$logFC, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Mbp")$adj.P.Val), colour = "black", shape = 1, size = 2)   +  geom_point(x = subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Casr")$logFC, y = -log10(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$mgi_symbol == "Casr")$adj.P.Val), colour = "black", shape = 1, size = 2) 
+
+ baseplot_PvsEearlyTotal3
+
+
+dev.off()
+```
+
+```{r CleanUp}
+# Clean up 
+rm(contrast.matrixTotal, designTotal, fitTotal, isexprTotal, counttableTotal)
+```
+
+
+Now separate out just the P7P90 comparison:
+
+```{r LimmaP7P90}
+counttableP7P90 <- counttable[,c( "P7B1", "P7B2", "P7B3", "P90B1", "P90B2", "P90B3")]
+groupsP7P90 <- substr(names(counttableP7P90),1, nchar(names(counttableP7P90)) - 1 )
+groups.df.P7P90 <- data.frame(groupsP7P90)
+groups.df.P7P90$sample <- names(counttableP7P90)
+groups.df.P7P90$stage <- as.factor(substr(groupsP7P90, 1, nchar(groupsP7P90)-1))
+groups.df.P7P90$region <- as.factor(substr(groupsP7P90, nchar(groupsP7P90), nchar(groupsP7P90)))
+groups.df.P7P90$stage <- relevel(groups.df.P7P90$stage, ref="P90")
+rm(groupsP7P90)
+
+designP7P90 <- model.matrix(~ 0 + groupsP7P90, data=groups.df.P7P90)
+designP7P90
+colnames(designP7P90) <- levels(groups.df.P7P90$groupsP7P90)
+
+yP7P90 <- DGEList(counts=counttableP7P90, genes=row.names(counttableP7P90))
+
+yP7P90unfiltered <- yP7P90
+isexprP7P90 <- rowSums(cpm(yP7P90)>0.7) >= 3
+limmatestedP7P90 <- as.vector((yP7P90$genes))
+yP7P90 <- yP7P90[isexprP7P90,]
+dim(yP7P90)
+
+yP7P90unfiltered <- calcNormFactors(yP7P90unfiltered)
+cpmP7P90 <- cpm(yP7P90unfiltered)
+yP7P90$samples$lib.size <- colSums(yP7P90$counts)
+yP7P90 <- calcNormFactors(yP7P90)
+vP7P90 <- voom(yP7P90,designP7P90,plot=TRUE)
+fitP7P90 <- lmFit(vP7P90,designP7P90)
+
+contrast.matrixP7P90 <- makeContrasts(BP90vsP7 = P90B - P7B, levels=designP7P90)
+
+fit2P7P90 <- contrasts.fit(fitP7P90, contrast.matrixP7P90)
+fit2P7P90 <- eBayes(fit2P7P90)
+resultsP7P90 <- decideTests(fit2P7P90,p.value=0.05, lfc=1)
+summary(resultsP7P90)
+
+BP90vsP7 <- topTable(fit2P7P90,  adjust="BH",lfc=1,p.value=0.05, number=Inf, sort="logFC",coef="BP90vsP7")
+
+rm(contrast.matrixP7P90, designP7P90, groups.df.P7P90, fitP7P90, isexprP7P90, counttableP7P90)
+```
+
+
+
+
+
+
+```{r AnnotateLimmaVoomResults}
+BP90vsP7.anno <- merge.data.frame(BP90vsP7, annotation, by.x="genes", by.y="ensembl_gene_id", all.x=TRUE)
+EBvsSTotal.anno <- merge.data.frame(EBvsSTotal, annotation, by.x="genes", by.y="ensembl_gene_id", all.x=TRUE)
+P7BvsSTotal.anno <- merge.data.frame(P7BvsSTotal, annotation, by.x="genes", by.y="ensembl_gene_id", all.x=TRUE)
+BvsSearlyTotal.anno <- merge.data.frame(BvsSearlyTotal, annotation, by.x="genes", by.y="ensembl_gene_id", all.x=TRUE)
+BP7vsETotal.anno <- merge.data.frame(BP7vsETotal, annotation, by.x="genes", by.y="ensembl_gene_id", all.x=TRUE)
+SP7vsETotal.anno <- merge.data.frame(SP7vsETotal, annotation, by.x="genes", by.y="ensembl_gene_id", all.x=TRUE)
+PvsEearlyTotal.anno <- merge.data.frame(PvsEearlyTotal, annotation, by.x="genes", by.y="ensembl_gene_id", all.x=TRUE)
+
+# Remove unannotated results
+rm("EBvsSTotal","P7BvsSTotal","BvsSearlyTotal","BP7vsETotal","SP7vsETotal","PvsEearlyTotal","BP90vsP7")
+
+# Which genes did we test?
+write.table(subset.data.frame(annotation, annotation$ensembl_gene_id %in% union(yTotal$genes[,1], yP7P90$genes[,1]), select="mgi_symbol"),file="alltestedgenesTotalRNA.txt", sep="\t", quote=FALSE, row.names=FALSE)
+
+
+# Export results for IPA
+write.table(BP90vsP7.anno, "IPA/BP90vsP7.anno.txt", sep ="\t", quote = FALSE, row.names = FALSE)
+write.table(EBvsSTotal.anno, "IPA/EBvsSTotal.anno.txt", sep ="\t", quote = FALSE, row.names = FALSE)
+write.table(P7BvsSTotal.anno, "IPA/P7BvsSTotal.anno.txt", sep ="\t", quote = FALSE, row.names = FALSE)
+write.table(BvsSearlyTotal.anno, "IPA/BvsSearlyTotal.anno.txt", sep ="\t", quote = FALSE, row.names = FALSE)
+write.table(BP7vsETotal.anno, "IPA/BP7vsETotal.anno.txt", sep ="\t", quote = FALSE, row.names = FALSE)
+write.table(SP7vsETotal.anno, "IPA/SP7vsETotal.anno.txt", sep ="\t", quote = FALSE, row.names = FALSE)
+write.table(PvsEearlyTotal.anno, "IPA/PvsEearlyTotal.anno.txt", sep ="\t", quote = FALSE, row.names = FALSE)
+
+
+```
+
+
+
+```{r GAGEgo}
+#library(gage)
+#data(kegg.gs)
+#library(pathview)
+#EBvsSgage.kegg <- gage(setNames(EBvsSTotal.anno$logFC, EBvsSTotal.anno$genes), gsets = kegg.gs, ref=NULL, sample = NULL)
+```
+
+```{r WriteOutDGElist}
+comparisonsOfInterestTotal <- c("EBvsS", "P7BvsS", "BvsSearly", "BP7vsE", "SP7vsE", "PvsEearly", "BP90vsP7")
+BP90vsP7Total.anno <- BP90vsP7.anno
+writeoutgenelist(comparisonsOfInterestTotal, "DGEA_total2.xlsx", suffix = "Total")
+
+```
+
+
+```{r UsingCPMMergeData}
+cpmTotalP7P90 <- merge(cpmTotal, cpmP7P90, by.x = 0, by.y = 0, all.x=TRUE )
+rm(cpmTotal, cpmP7P90)
+#Lets see how we need to scale the P7P90 data
+summary(cpmTotalP7P90$P7B1.y/cpmTotalP7P90$P7B1.x ) #0.86
+summary(cpmTotalP7P90$P7B2.y/cpmTotalP7P90$P7B2.x ) #0.884 *median
+summary(cpmTotalP7P90$P7B3.y/cpmTotalP7P90$P7B3.x ) #0.884
+# To scale the P90 to "x" - i.e. all the other datasets, we need to
+cpmTotalP7P90$P90B1.x = 0.884 * cpmTotalP7P90$P90B1
+cpmTotalP7P90$P90B2.x = 0.884 * cpmTotalP7P90$P90B2
+cpmTotalP7P90$P90B3.x = 0.884 * cpmTotalP7P90$P90B3
+
+cpmTotalP7P90$P90B1 <- NULL
+cpmTotalP7P90$P90B2 <- NULL
+cpmTotalP7P90$P90B3 <- NULL
+cpmTotalP7P90$P7B1.x <- NULL
+cpmTotalP7P90$P7B2.x <- NULL
+cpmTotalP7P90$P7B3.x <- NULL
+
+names(cpmTotalP7P90) <- c("Gene", "E13.5B1", "E13.5B2", "E13.5B3", "E13.5S1", "E13.5S2", "E13.5S3", "P7S1", "P7S2", "P7S3", "P7B1", "P7B2", "P7B3", "P90B1", "P90B2", "P90B3")
+row.names(cpmTotalP7P90) <- cpmTotalP7P90$Gene
+cpmTotalP7P90$Gene <- NULL
+tmprename <- merge.data.frame(cpmTotalP7P90, annotation, by.x= 0, by.y = "ensembl_gene_id", all.x=TRUE)
+tmprename$gene_biotype <- NULL
+tmprename$description <- NULL
+cpmTotalP7P90 <- tmprename
+rm(tmprename)
+```
+
+
+
+
+
+```{r DESeq2}
+library(DESeq2)
+ddsTotal <- DESeqDataSetFromMatrix(countData = counttable[,1:12], colData = groups.df.Total ,design =~ 0 + groupsTotal)
+colnames(ddsTotal) <- names(counttable[,1:12])
+ddsTotal <- DESeq(ddsTotal,modelMatrixType="standard", betaPrior = FALSE)
+
+
+# dds <- DESeq(dds)
+vsd <- varianceStabilizingTransformation(ddsTotal, blind = TRUE)
+# Heat map
+select <- order(rowMeans(counts(ddsTotal,normalized=TRUE)),decreasing=TRUE)[1:500]
+hmcol <- colorRampPalette(brewer.pal(9, "GnBu"))(100)
+library(gplots)
+heatmap.2(assay(vsd)[select,], col = hmcol, Rowv = FALSE,  Colv = TRUE, scale="none",dendrogram="column", trace="none", margin=c(10, 6), labRow = annotation[select,"mgi_symbol"])
+
+data <- plotPCA(vsd, intgroup=c("groupsTotal", "region"), returnData=TRUE)
+percentVar <- round(100 * attr(data, "percentVar"))
+ggplot(data, aes(PC1, PC2, color=groupsTotal,shape=region)) +  geom_point(size=4) + xlab(paste0("PC1: ",percentVar[1],"% variance")) +  ylab(paste0("PC2: ",percentVar[2],"% variance")) + theme_bw() + scale_color_manual(values=c("#e31a1c", "#fb9a99", "#1f78b4", "#a6cee3")) +
+  annotate("text", label = "E13.5S", x = -38, y = 28, size = 6, color = "#fb9a99")+
+  annotate("text", label = "E13.5B", x = -30, y = -30, size = 6, color = "#e31a1c")+
+  annotate("text", label = "P7S", x = 58, y = 17, size = 6, color = "#a6cee3")+
+  annotate("text", label = "P7B", x = 47, y = -20, size = 6, color = "#1f78b4")+
+  theme(legend.position="right")
+rm(data)
+
+library(genefilter)
+rv = rowVars(assay(vsd))
+select = order(rv, decreasing=TRUE)[seq_len(500)]
+pca = prcomp(t(assay(vsd)[select,]))
+pcasum <- data.frame(summary(pca)[6])
+pcasum2 <- data.frame(t(pcasum[2,]))
+ggplot(pcasum2, aes(x=as.factor(c(1,2,3,4,5,6,7,8,9,10,11,12)), y= Proportion.of.Variance)) + geom_bar(stat="identity")+ theme_bw() + labs(x = "Principle component", y = "Proportion of Variance Explained")
+
+rm(pcasum, pcasum2, rv, select, vsd, hmcol)
+
+
+# now same for total
+ddsTotal <- estimateSizeFactors(ddsTotal)
+idx.nzTotal <- apply(counts(ddsTotal), 1, function(x) { all(x > 0)})
+multidensity( counts(ddsTotal, normalized = T)[idx.nzTotal ,], xlab="mean counts", xlim=c(0, 1000))
+multiecdf( counts(ddsTotal, normalized = T)[idx.nzTotal ,], xlab="mean counts", xlim=c(0, 1000))
+
+pdf("pairwiseMAsTotal.pdf")
+  MA.idx = t(combn(1:12, 2))
+  for( i in  seq_along( MA.idx[,1])){
+   MDPlot(counts(ddsTotal, normalized = T)[idx.nzTotal ,],
+        c(MA.idx[i,1],MA.idx[i,2]),
+    main = paste( colnames(ddsTotal)[MA.idx[i,1]], " vs ",
+     colnames(ddsTotal)[MA.idx[i,2]] ), ylim = c(-3,3))
+    }
+dev.off()
+rm(idx.nzTotal, MA.idx)
+
+
+# EBvsS
+ddsTotal <- estimateSizeFactors(ddsTotal)
+
+DESeq_EBvsS <- results(ddsTotal, contrast = c("groupsTotal","E13.5B", "E13.5S"))
+DESeq_EBvsSSig <- subset(DESeq_EBvsS, ((padj < 0.01) & (abs(log2FoldChange) >= 1)))
+DESeq_EBvsSSig <- DESeq_EBvsSSig[order(-DESeq_EBvsSSig$log2FoldChange),]
+plotMA(DESeq_EBvsS)
+DESeq_EBvsS$threshold <- as.factor(row.names(DESeq_EBvsS) %in% EBvsSTotal.anno$genes)
+# Now do the plotting
+baseplot_DESeq_EBvsS <- ggplot(as.data.frame(DESeq_EBvsS), aes(x = log2FoldChange,y = -log10(padj), colour = threshold)) + theme_bw() + geom_point(alpha = 1, size=2) + theme(legend.position = "none") + xlab("log-fold change") + ylab("-log10(padj)") + theme(axis.text.x=element_text(size=18)) + theme(axis.text.y=element_text(size=18))+ theme(axis.title.x=element_text(size=18)) + theme(axis.title.y=element_text(size=18)) + coord_cartesian(xlim = c(-12, 12), ylim=c(-5, 150))
+baseplot_DESeq_EBvsS
+
+```
+
+Note to self: When I used the parentchild algorithm, I got a large number of GO terms that are much more general than when I use elim. So elim is much more robust to what we're interested in.
+
+```{r TopGO}
+
+topGOsingleOntologyFisherElim <- function(ontology, allGenes,nodeSize, pelimcutoff, resultsdataframe, prefix){
+  # note that resultsdataframe.anno with columns "genes", "" and "" must exist
+  # GetGeneDirection must be defined as above
+  ## prepare data
+  tgd <- new( "topGOdata", ontology=ontology, allGenes = allGenes, nodeSize=nodeSize, annot=annFUN.org, mapping="org.Mm.eg.db", ID = "ensembl" )
+  ## run tests
+  resultTopGO.elim <- runTest(tgd, algorithm = "elim", statistic = "Fisher" )
+  ## look at results
+  tabEL <- GenTable( tgd, Fisher.elim = resultTopGO.elim, orderBy = "Fisher.elim" , topNodes = sum(score(resultTopGO.elim) < pelimcutoff))
+  tabEL$Fisher.elim.pvalue <- as.numeric(tabEL$Fisher.elim)
+  tabEL$Fisher.elim <- NULL
+  printGraph(tgd, resultTopGO.elim, firstSigNodes = 5, fn.prefix = paste0(prefix, paste0("_", ontology)), useInfo = "all", pdfSW = TRUE)
+  printGraph(tgd, resultTopGO.elim, firstSigNodes = 15, fn.prefix = paste0(prefix, paste0("_", ontology)), useInfo = "all", pdfSW = TRUE)
+  printGraph(tgd, resultTopGO.elim, firstSigNodes = 25, fn.prefix = paste0(prefix, paste0("_", ontology)), useInfo = "all", pdfSW = TRUE)
+
+  allGO <- genesInTerm(tgd)
+  goAnnoBasic.GenesAsListDataTable.FromEnsDB.bp <- data.table(allGO) # stopped here - make sure to get this as data table and export (per comparison)
+  names(goAnnoBasic.GenesAsListDataTable.FromEnsDB.bp) <- "geneID"
+  goAnnoBasic.GenesAsListDataTable.FromEnsDB.bp$go_id <- names(allGO)
+
+
+  mycurrentcontrastgoseq.sig.anno <- merge.data.frame(tabEL, goAnnoBasic.GenesAsListDataTable.FromEnsDB.bp, by.x="GO.ID", by.y="go_id", all.x=TRUE)
+
+  #nameofdataframeIwant <-paste0(resultsdataframe, ".anno")
+  tmp <- eval(as.name(resultsdataframe))
+
+  #tmp <- eval(as.name(paste0(deparse(mycurrentcontrast), ".anno")))
+  
+  mycurrentcontrastgoseq.sig.anno$ensg_genes_detected_as_DE <- lapply(mycurrentcontrastgoseq.sig.anno[,"geneID"], function(x) x[x %in% tmp$genes])
+  
+  mycurrentcontrastgoseq.sig.anno$mgi_gene_symbol <- lapply(mycurrentcontrastgoseq.sig.anno[,"geneID"], function(x) as.character(genenameslist[x]))
+  #mycurrentcontrastgoseq.sig.anno["mgi_gene_symbol"] <-   apply(mycurrentcontrastgoseq.sig.anno["mgi_gene_symbol"], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+  
+  
+  mycurrentcontrastgoseq.sig.anno$mgi_genes_detected_as_DE <- lapply(mycurrentcontrastgoseq.sig.anno[,"ensg_genes_detected_as_DE"], function(x) as.character(genenameslist[x]))
+ # mycurrentcontrastgoseq.sig.anno["mgi_genes_detected_as_DE"] <-   apply(mycurrentcontrastgoseq.sig.anno["mgi_genes_detected_as_DE"], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+
+  
+  mycurrentcontrastgoseq.sig.anno$IndividualGeneDirection <- lapply(mycurrentcontrastgoseq.sig.anno[,"ensg_genes_detected_as_DE"], function(x) GetGeneDirection(x, tmp))
+  
+
+#mycurrentcontrastgoseq.sig.anno$IndividualGeneDirection <-   apply(mycurrentcontrastgoseq.sig.anno['IndividualGeneDirection'], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+
+  
+ mycurrentcontrastgoseq.sig.anno$OverallDirection <- sapply(mycurrentcontrastgoseq.sig.anno[,"IndividualGeneDirection"], function(x) sum(x))
+
+ mycurrentcontrastgoseq.sig.anno$IndividualGeneDirection <-   apply(mycurrentcontrastgoseq.sig.anno['IndividualGeneDirection'], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+ 
+  mycurrentcontrastgoseq.sig.anno["geneID"] <- apply(mycurrentcontrastgoseq.sig.anno["geneID"], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+  #mycurrentcontrastgoseq.sig.anno["geneID"] <-   apply(mycurrentcontrastgoseq.sig.anno["geneID"], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+
+  #mycurrentcontrastgoseq.sig.anno["ensg_genes_detected_as_DE"] <-   apply(mycurrentcontrastgoseq.sig.anno["ensg_genes_detected_as_DE"], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+  return(mycurrentcontrastgoseq.sig.anno)
+}
+
+topGOwithGeneSelection <- function(cpmmTable = cpmTotalP7P90, rangeofnumericcolumns = 2:16, genenamecolumnInCpmmTable = "Row.names", comparisonstring = "EBvsSTotal", DEdataframe = "EBvsSTotal.anno", nodeSize = 5, pelimcutoff = 0.01, prefix = "EBvsS"){
+	# DEdataframe must  have a "genes" column! with the ensembl identifier of differentially expressed genes
+
+backG <- genefinder(as.matrix(subset(cpmmTable[rangeofnumericcolumns])), which(unlist(cpmmTable[genenamecolumnInCpmmTable]) %in% eval(as.name(DEdataframe))$genes), 10, method = "manhattan")
+backG <- unlist(cpmmTable[genenamecolumnInCpmmTable], use.names = FALSE)[as.vector(sapply(backG, function(x)x$indices))]
+backG <- setdiff(backG ,  eval(as.name(DEdataframe))$genes)
+
+
+pdf(paste0(c("MatchingForEnrichmentAnalysis_", comparisonstring, ".pdf"), collapse=""))
+
+multidensity( list(all= log2(as.matrix(subset(cpmmTable[rangeofnumericcolumns])) + 0.01) ,
+                   foreground =log2(as.matrix(subset(cpmmTable[(unlist(cpmmTable[genenamecolumnInCpmmTable]) %in% eval(as.name(DEdataframe))$genes),rangeofnumericcolumns])) + 0.01),
+                   #	subset.data.frame(cpmTotalP7P90, cpmTotalP7P90$Row.names %in% EBvsSTotal.anno$genes)[2:16])+ 0.01),
+                   background =log2(as.matrix(subset(cpmmTable[(unlist(cpmmTable[genenamecolumnInCpmmTable]) %in% backG),rangeofnumericcolumns]) + 0.01))),
+                   #background =log2(as.matrix(subset.data.frame(cpmTotalP7P90, cpmTotalP7P90$Row.names %in% backG )[2:16]+ 0.01))),
+              	   xlab="log2 mean normalized counts", main = paste0(c("Matching for enrichment analysis, ", comparisonstring), collapse=""))
+dev.off()
+
+inUniverse = unlist(cpmmTable[genenamecolumnInCpmmTable]) %in% c(eval(as.name(DEdataframe))$genes, backG)
+inSelection =  unlist(cpmmTable[genenamecolumnInCpmmTable]) %in% c(eval(as.name(DEdataframe))$genes)
+alg <- factor( as.integer( inSelection[inUniverse] ) )
+names(alg) <- unlist(cpmmTable[genenamecolumnInCpmmTable])[inUniverse]
+
+
+# Now do the GO analysis
+bp <- topGOsingleOntologyFisherElim(ontology = "BP", alg, nodeSize, pelimcutoff, DEdataframe, prefix)
+bp$ontology <- "BP"
+cc <- topGOsingleOntologyFisherElim(ontology = "CC", alg, nodeSize, pelimcutoff, DEdataframe, prefix)
+cc$ontology <- "CC"
+mf <- topGOsingleOntologyFisherElim(ontology = "MF", alg, nodeSize, pelimcutoff, DEdataframe, prefix)
+mf$ontology <- "MF"
+return(rbind(bp, rbind(cc, mf)))
+}
+
+setwd("./GO2")
+
+
+for (comparison in comparisonsOfInterestTotal){
+  assign(paste0(c(comparison, "Total.GO"), collapse = ""), topGOwithGeneSelection(cpmmTable = cpmTotalP7P90, rangeofnumericcolumns = 2:16, genenamecolumnInCpmmTable = "Row.names", comparisonstring = paste0(c(comparison, "Total"), collapse = ""), DEdataframe = paste0(c(comparison, "Total", ".anno"), collapse = ""), nodeSize = 5, pelimcutoff = 0.01, prefix = comparison))
+}
+```
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                
+
+```{r InsaneInefficiency}
+EBvsSTotal.GO$mgi_gene_symbol <- apply(as.data.frame(EBvsSTotal.GO)['mgi_gene_symbol'], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+EBvsSTotal.GO$geneID <- apply(as.data.frame(EBvsSTotal.GO)['geneID'], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+EBvsSTotal.GO$ensg_genes_detected_as_DE <- apply(as.data.frame(EBvsSTotal.GO)['ensg_genes_detected_as_DE'], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+EBvsSTotal.GO$mgi_genes_detected_as_DE <- apply(as.data.frame(EBvsSTotal.GO)['mgi_genes_detected_as_DE'], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+EBvsSTotal.GO$IndividualGeneDirection <- apply(as.data.frame(EBvsSTotal.GO)['IndividualGeneDirection'], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+P7BvsSTotal.GO$mgi_gene_symbol <- apply(as.data.frame(P7BvsSTotal.GO)['mgi_gene_symbol'], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+P7BvsSTotal.GO$geneID <- apply(as.data.frame(P7BvsSTotal.GO)['geneID'], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+P7BvsSTotal.GO$ensg_genes_detected_as_DE <- apply(as.data.frame(P7BvsSTotal.GO)['ensg_genes_detected_as_DE'], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+P7BvsSTotal.GO$mgi_genes_detected_as_DE <- apply(as.data.frame(P7BvsSTotal.GO)['mgi_genes_detected_as_DE'], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+P7BvsSTotal.GO$IndividualGeneDirection <- apply(as.data.frame(P7BvsSTotal.GO)['IndividualGeneDirection'], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+BvsSearlyTotal.GO$mgi_gene_symbol <- apply(as.data.frame(BvsSearlyTotal.GO)['mgi_gene_symbol'], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+BvsSearlyTotal.GO$geneID <- apply(as.data.frame(BvsSearlyTotal.GO)['geneID'], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+BvsSearlyTotal.GO$ensg_genes_detected_as_DE <- apply(as.data.frame(BvsSearlyTotal.GO)['ensg_genes_detected_as_DE'], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+BvsSearlyTotal.GO$mgi_genes_detected_as_DE <- apply(as.data.frame(BvsSearlyTotal.GO)['mgi_genes_detected_as_DE'], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+BvsSearlyTotal.GO$IndividualGeneDirection <- apply(as.data.frame(BvsSearlyTotal.GO)['IndividualGeneDirection'], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+BP7vsETotal.GO$mgi_gene_symbol <- apply(as.data.frame(BP7vsETotal.GO)['mgi_gene_symbol'], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+BP7vsETotal.GO$geneID <- apply(as.data.frame(BP7vsETotal.GO)['geneID'], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+BP7vsETotal.GO$ensg_genes_detected_as_DE <- apply(as.data.frame(BP7vsETotal.GO)['ensg_genes_detected_as_DE'], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+BP7vsETotal.GO$mgi_genes_detected_as_DE <- apply(as.data.frame(BP7vsETotal.GO)['mgi_genes_detected_as_DE'], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+BP7vsETotal.GO$IndividualGeneDirection <- apply(as.data.frame(BP7vsETotal.GO)['IndividualGeneDirection'], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+SP7vsETotal.GO$mgi_gene_symbol <- apply(as.data.frame(SP7vsETotal.GO)['mgi_gene_symbol'], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+SP7vsETotal.GO$geneID <- apply(as.data.frame(SP7vsETotal.GO)['geneID'], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+SP7vsETotal.GO$ensg_genes_detected_as_DE <- apply(as.data.frame(SP7vsETotal.GO)['ensg_genes_detected_as_DE'], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+SP7vsETotal.GO$mgi_genes_detected_as_DE <- apply(as.data.frame(SP7vsETotal.GO)['mgi_genes_detected_as_DE'], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+SP7vsETotal.GO$IndividualGeneDirection <- apply(as.data.frame(SP7vsETotal.GO)['IndividualGeneDirection'], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+PvsEearlyTotal.GO$mgi_gene_symbol <- apply(as.data.frame(PvsEearlyTotal.GO)['mgi_gene_symbol'], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+PvsEearlyTotal.GO$geneID <- apply(as.data.frame(PvsEearlyTotal.GO)['geneID'], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+PvsEearlyTotal.GO$ensg_genes_detected_as_DE <- apply(as.data.frame(PvsEearlyTotal.GO)['ensg_genes_detected_as_DE'], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+PvsEearlyTotal.GO$mgi_genes_detected_as_DE <- apply(as.data.frame(PvsEearlyTotal.GO)['mgi_genes_detected_as_DE'], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+PvsEearlyTotal.GO$IndividualGeneDirection <- apply(as.data.frame(PvsEearlyTotal.GO)['IndividualGeneDirection'], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+BP90vsP7Total.GO$mgi_gene_symbol <- apply(as.data.frame(BP90vsP7Total.GO)['mgi_gene_symbol'], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+BP90vsP7Total.GO$geneID <- apply(as.data.frame(BP90vsP7Total.GO)['geneID'], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+BP90vsP7Total.GO$ensg_genes_detected_as_DE <- apply(as.data.frame(BP90vsP7Total.GO)['ensg_genes_detected_as_DE'], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+BP90vsP7Total.GO$mgi_genes_detected_as_DE <- apply(as.data.frame(BP90vsP7Total.GO)['mgi_genes_detected_as_DE'], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+BP90vsP7Total.GO$IndividualGeneDirection <- apply(as.data.frame(BP90vsP7Total.GO)['IndividualGeneDirection'], 1, function(x) paste(unlist(x), sep=", ", collapse=", "))
+
+listofobjectstoxls(characterlistofobjectnames = comparisonsOfInterestTotal, filename = "topGO_elim.xlsx", suffix = "Total.GO")
+
+```
+
+```{r ExportForEnrichmentMap}
+
+# Uncomment two lines if need to rerun
+#GOfromDB <- AnnotationDbi::select(org.Mm.eg.db, keys=row.names(counttable), keytype = "ENSEMBL", columns = c("ENSEMBL", "GO"))
+#saveRDS(GOfromDB, "GOfromDB.Robj")
+GOfromDB <- readRDS("../GOfromDB.Robj")
+
+#ensembl=useMart(host="www.ensembl.org", biomart="ENSEMBL_MART_ENSEMBL", dataset = "mmusculus_gene_ensembl")
+#go_map <- getBM(attributes=c("go_id", "name_1006"), filters = "go_id", values=GOfromDB$GO, mart=ensembl)
+go_map <- readRDS("../go_map.Robj")
+GOfromDBnamed <- data.table(merge.data.frame(go_map, GOfromDB, by.x = "go_id", by.y="GO", all.y=TRUE))
+rm(GOfromDB, go_map)
+
+goTMP <- GOfromDBnamed[, list(genes = paste(ENSEMBL, collapse = ","), name = name_1006, ontology = ONTOLOGY), by = go_id]
+goTMPuniq <- unique(goTMP)
+goTMPuniq.cc <- goTMPuniq[complete.cases(goTMPuniq),]
+goTMPuniq.ic <- goTMPuniq[!complete.cases(goTMPuniq),]
+
+# Goanna search
+goGOANNA <- goana(rep(1, 99999999), universe = NULL, species = "Mm", prior.prob = NULL, covariate=NULL)
+goGOANNA$Ont <- NULL
+goGOANNA$go_id <- row.names(goGOANNA)
+goGOANNA$N <- NULL
+goGOANNA$DE <- NULL
+goGOANNA$P.DE <- NULL
+
+# clean up
+goTMPuniq.ic.anno <- merge.data.frame(goTMPuniq.ic, goGOANNA, by = "go_id")
+goTMPuniq.ic.anno$name <- NULL
+goTMPuniq.ic.anno$name <- goTMPuniq.ic.anno$Term
+goTMPuniq.ic.anno$Term <- NULL
+
+goTMPuniq2 <- rbind(goTMPuniq.cc, goTMPuniq.ic.anno)
+
+GOfromDB <- goTMPuniq2
+
+GOfromDBextra <- rbind(subset.data.frame(EBvsSTotal.GO, EBvsSTotal.GO$GO.ID %ni% GOfromDB$go_id, select = c("GO.ID", "Term", "geneID", "ontology")), rbind(subset.data.frame(P7BvsSTotal.GO, P7BvsSTotal.GO$GO.ID %ni% GOfromDB$go_id, select = c("GO.ID", "Term", "geneID", "ontology")) , rbind(subset.data.frame(BvsSearlyTotal.GO, BvsSearlyTotal.GO$GO.ID %ni% GOfromDB$go_id, select = c("GO.ID", "Term", "geneID", "ontology")), rbind(subset.data.frame(BP7vsETotal.GO, BP7vsETotal.GO$GO.ID %ni% GOfromDB$go_id, select = c("GO.ID", "Term", "geneID", "ontology")) , rbind (subset.data.frame(SP7vsETotal.GO, SP7vsETotal.GO$GO.ID %ni% GOfromDB$go_id, select = c("GO.ID", "Term", "geneID", "ontology")), rbind(subset.data.frame(PvsEearlyTotal.GO, PvsEearlyTotal.GO$GO.ID %ni% GOfromDB$go_id, select = c("GO.ID", "Term", "geneID", "ontology")),subset.data.frame(BP90vsP7Total.GO, BP90vsP7Total.GO$GO.ID %ni% GOfromDB$go_id, select = c("GO.ID", "Term", "geneID", "ontology")) ))))))
+
+names(GOfromDBextra) <- c("go_id","name","genes","ontology")
+
+
+rm(goTMPuniq, goTMPuniq.ic.anno, goTMPuniq.cc, goTMP, GOfromDBnamed, goTMPuniq2,goGOANNA, goTMPuniq.ic)
+
+GOfromDB.final <- rbind(GOfromDB, GOfromDBextra)
+rm(GOfromDBextra, GOfromDB)
+
+write.table(subset.data.frame(GOfromDB.final, select = c("go_id", "name", "genes")), "GOfromDB.final2.gmt", sep ="\t", row.names = FALSE, col.names=FALSE, quote=FALSE)
+
+for (comparison in paste0(comparisonsOfInterestTotal, "Total.GO")) {
+  
+  tmp <- subset.data.frame(eval(as.name(comparison)),abs(eval(as.name(comparison))$OverallDirection) >= 10, select = c("GO.ID", "Term", "Fisher.elim.pvalue","Fisher.elim.pvalue","OverallDirection"))
+  tmp$phenotype <- sapply(tmp$OverallDirection, function(x) if (x > 0) {1} else {-1})
+  tmp$OverallDirection <- NULL
+  names(tmp) <- c("ID", "Name", "p-value", "FDR", "phenotype")
+  write.table(tmp, paste0(comparison, "2.get.txt"), sep ="\t", quote=FALSE, row.names = FALSE)
+}
+rm(tmp)
+
+write.table(subset.data.frame(cpmTotalP7P90, select = c("Row.names","mgi_symbol", "E13.5B1", "E13.5B2", "E13.5B3", "E13.5S1", "E13.5S2", "E13.5S3")),"EBvsS.express.txt", sep ="\t", row.names = FALSE)
+
+write.table(subset.data.frame(cpmTotalP7P90, select = c("Row.names","mgi_symbol", "P7S1", "P7S2", "P7S3", "P7B1", "P7B2", "P7B3", "P90B1", "P90B2", "P90B3")),"P7BvsS.express.txt", sep ="\t", row.names = FALSE)
+
+write.table(subset.data.frame(cpmTotalP7P90, select = c("Row.names","mgi_symbol", "E13.5B1", "E13.5B2", "E13.5B3", "E13.5S1", "E13.5S2", "E13.5S3", "P7S1", "P7S2", "P7S3", "P7B1", "P7B2", "P7B3")),"BvsSearly.express.txt", sep ="\t", row.names = FALSE)
+
+write.table(subset.data.frame(cpmTotalP7P90, select = c("Row.names","mgi_symbol", "E13.5B1", "E13.5B2", "E13.5B3", "P7B1", "P7B2", "P7B3")),"BP7vsE.express.txt", sep ="\t", row.names = FALSE)
+
+write.table(subset.data.frame(cpmTotalP7P90, select = c("Row.names","mgi_symbol", "E13.5S1", "E13.5S2", "E13.5S3", "P7S1", "P7S2", "P7S3")),"SP7vsE.express.txt", sep ="\t", row.names = FALSE)
+
+write.table(subset.data.frame(cpmTotalP7P90, select = c("Row.names","mgi_symbol", "E13.5B1", "E13.5B2", "E13.5B3", "E13.5S1", "E13.5S2", "E13.5S3", "P7S1", "P7S2", "P7S3", "P7B1", "P7B2", "P7B3")),"PvsEearly.express.txt", sep ="\t", row.names = FALSE)
+
+write.table(subset.data.frame(cpmTotalP7P90, select = c("Row.names","mgi_symbol", "P7B1", "P7B2", "P7B3", "P90B1", "P90B2", "P90B3")),"BP90vsP7.express.txt", sep ="\t", row.names = FALSE) 
+
+write.table(cpmTotalP7P90, "cpmTotalP7P90.express", sep ="\t", row.names = FALSE)
+
+```
+
+
+```{r ForMsigDB}
+EBvsS.msig <- data.table(topTable(fit2,  adjust="BH",lfc=0,p.value=1, number=Inf, sort="p",coef="EBvsS"))
+PBvsS.msig <- data.table(topTable(fit2,  adjust="BH",lfc=0,p.value=1, number=Inf, sort="p",coef="PBvsS"))
+BvsS.msig <- data.table(topTable(fit2,  adjust="BH",lfc=0,p.value=1, number=Inf, sort="p",coef="BvsS"))
+BPvsE.msig <- data.table(topTable(fit2,  adjust="BH",lfc=0,p.value=1, number=Inf, sort="p",coef="BPvsE"))
+SPvsE.msig <- data.table(topTable(fit2,  adjust="BH",lfc=0,p.value=1, number=Inf, sort="p",coef="SPvsE"))
+PvsE.msig <- data.table(topTable(fit2,  adjust="BH",lfc=0,p.value=1, number=Inf, sort="p",coef="PvsE"))
+
+
+EBvsS.msig.anno <- data.table(merge.data.frame(annotation, EBvsS.msig, by.x="ensembl_gene_id", by.y="genes"))
+PBvsS.msig.anno <- data.table(merge.data.frame(annotation, PBvsS.msig, by.x="ensembl_gene_id", by.y="genes"))
+BvsS.msig.anno <- data.table(merge.data.frame(annotation, BvsS.msig, by.x="ensembl_gene_id", by.y="genes"))
+BPvsE.msig.anno <- data.table(merge.data.frame(annotation, BPvsE.msig, by.x="ensembl_gene_id", by.y="genes"))
+SPvsE.msig.anno <- data.table(merge.data.frame(annotation, SPvsE.msig, by.x="ensembl_gene_id", by.y="genes"))
+PvsE.msig.anno <- data.table(merge.data.frame(annotation, PvsE.msig, by.x="ensembl_gene_id", by.y="genes"))
+
+
+
+EBvsS.msig.anno[, c("rankms"):=(if (logFC < 0) (-1/adj.P.Val) else  (1/adj.P.Val)), by=ensembl_gene_id]
+PBvsS.msig.anno[, c("rankms"):=(if (logFC < 0) (-1/adj.P.Val) else  (1/adj.P.Val)), by=ensembl_gene_id]
+BvsS.msig.anno[, c("rankms"):=(if (logFC < 0) (-1/adj.P.Val) else  (1/adj.P.Val)), by=ensembl_gene_id]
+BPvsE.msig.anno[, c("rankms"):=(if (logFC < 0) (-1/adj.P.Val) else  (1/adj.P.Val)), by=ensembl_gene_id]
+SPvsE.msig.anno[, c("rankms"):=(if (logFC < 0) (-1/adj.P.Val) else  (1/adj.P.Val)), by=ensembl_gene_id]
+PvsE.msig.anno[, c("rankms"):=(if (logFC < 0) (-1/adj.P.Val) else  (1/adj.P.Val)), by=ensembl_gene_id]
+setkey(EBvsS.msig.anno, "rankms")
+setkey(PBvsS.msig.anno, "rankms")
+setkey(BvsS.msig.anno, "rankms")
+setkey(BPvsE.msig.anno, "rankms")
+setkey(SPvsE.msig.anno, "rankms")
+setkey(PvsE.msig.anno, "rankms")
+
+
+
+
+```
+
+
+
+
+
+```{r SciencePaperChannels}
+sciencepaperchannels <- levels(read.csv("/Users/darya/Dropbox/SUELI_DARYA BULK SEQ/2016_Darya/01_DifferentialGeneList/referencegenelists/sciencepaperchannelsSupp14.txt", header=FALSE)$V1 )
+table(sciencepaperchannels %in% annotation$mgi_symbol )
+
+allcomparisonsTogether <- rbind(rbind(rbind(rbind(rbind(rbind(rbind(EBvsS.anno, P7BvsS.anno), BvsSearly.anno), BvsSall.anno), BP7vsE.anno), SP7vsE.anno), PvsEearly.anno), PvsEall.anno, BP90vsP7.anno)
+
+
+alldifferentiallyexpressedgenes <- union(union(union(union(union(union(BP90vsP7$genes, BP7vsETotal$genes), SP7vsETotal$genes), PvsEearlyTotal$genes), BvsSearlyTotal$genes), P7BvsSTotal$genes), EBvsSTotal$genes)
+
+alldifferentiallyexpressedgenesMGI <- union(union(union(union(union(union(BP90vsP7$mgi_symbol, BP7vsETotal.anno$mgi_symbol), SP7vsETotal.anno$mgi_symbol), PvsEearlyTotal.anno$mgi_symbol), BvsSearlyTotal.anno$mgi_symbol), P7BvsSTotal.anno$mgi_symbol), EBvsSTotal.anno$mgi_symbol)
+
+write.csv(alldifferentiallyexpressedgenesMGI, "alldifferentiallyexpressedgenesMGI.txt", quote = FALSE, row.names = FALSE, col.names  = NULL)
+
+write.csv(alldifferentiallyexpressedgenes, "alldifferentiallyexpressedgenes.txt", quote = FALSE, row.names = FALSE, col.names  = NULL)
+
+alldifferentiallyexpressedgenes.anno <- subset.data.frame(annotation, annotation$ensembl_gene_id %in% alldifferentiallyexpressedgenes)
+
+write.csv(alldifferentiallyexpressedgenes.anno, "alldifferentiallyexpressedgenes.anno.csv", quote = FALSE, row.names = FALSE)
+
+
+
+
+allcomparisonsTogether.sciencepaper <- subset.data.frame(allcomparisonsTogether, allcomparisonsTogether$mgi_symbol %in% sciencepaperchannels)
+write.csv(allcomparisonsTogether.sciencepaper, "allcomparisonstogethersciencepaper.csv", row.names = FALSE)
+
+
+
+counttableNorm.sciencepapergenes <- subset.data.frame(counttableNorm.anno, counttableNorm.anno$mgi_symbol %in% sciencepaperchannels)
+counttableNorm.sciencepapergenes$gene_biotype <- NULL
+counttableNorm.sciencepapergenes$Row.names <- NULL
+counttableNorm.sciencepapergenes$description <- NULL
+row.names(counttableNorm.sciencepapergenes) <- counttableNorm.sciencepapergenes$mgi_symbol
+#counttableNorm.sciencepapergenes$mgi_symbol <- NULL
+
+counttableNorm.sciencepapergenes.melt <- melt(counttableNorm.sciencepapergenes)
+#counttableNorm.sciencepapergenes.melt$Row.names <- as.character(counttableNorm.sciencepapergenes.melt$Row.names)
+#counttableNorm.sciencepapergenes.melt$tissue <- as.numeric(as.factor(counttableNorm.sciencepapergenes.melt$tissue), ordered = TRUE)
+#counttableNorm.sciencepapergenes.melt$Row.names <- reorder(counttableNorm.sciencepapergenes.melt$Row.names, counttableNorm.sciencepapergenes.melt$tissue,order = is.ordered(counttableNorm.sciencepapergenes.melt$Row.names))
+hmcol <- colorRampPalette(brewer.pal(9, "YlGnBu"))(100)
+# heatmap.2(log(as.matrix(counttableNorm.sciencepapergenes[,2:13])+1), col = hmcol, Rowv = TRUE, Colv = FALSE, scale="none",dendrogram="both", trace="none", margin=c(10, 6),labRow = counttableNorm.sciencepapergenes$Row.names)
+
+heatmap.2(log(as.matrix(counttableNorm.sciencepapergenes[,1:15])+1), col = hmcol, Rowv = TRUE, Colv = TRUE, scale="none",dendrogram="both", trace="none", margin=c(10, 6),labRow = counttableNorm.sciencepapergenes$Row.names)
+
+
+#ggplot(counttableNorm.sciencepapergenes.melt,aes(x=variable,y=mgi_symbol,fill=log(value+.1))) + geom_tile() + labs(x="Stage",y="Gene")+scale_x_discrete(expand=c(0,0))+ scale_fill_gradient(name="log(cpmm+.1)",  low="#edf8b1", high="#2c7fb8")+theme_bw()+theme(axis.ticks=element_blank(),legend.position="bottom") + geom_vline(xintercept=3.5,linetype="dotted")	+ geom_vline(xintercept=9.5,linetype="dotted")	+ geom_vline(xintercept=6.5)	 		+ geom_vline(xintercept=12.5)
+```
+
+
+
+
+
+
+```{r SciencePaperChannelsCPMM}
+library(heatmap3)
+sciencepaperchannels <- levels(read.csv("/isilon/store1/NGS/daryav/160629_OPCdgea/sciencepaperchannelsSupp14.txt", header=FALSE)$V1 )
+
+sciencepaperchannelsCPMM <- subset.data.frame(cpmTotalP7P90, cpmTotalP7P90$mgi_symbol %in% sciencepaperchannels)
+sciencepaperchannelsNotInCPMM <- sciencepaperchannels[sciencepaperchannels %ni% cpmTotalP7P90$mgi_symbol]
+subset.data.frame(counttableNorm.anno, counttableNorm.anno$mgi_symbol %in% sciencepaperchannelsNotInCPMM)
+sciencepaperchannelsCPMM$Row.names <- NULL
+row.names(sciencepaperchannelsCPMM) <- sciencepaperchannelsCPMM$mgi_symbol
+sciencepaperchannelsCPMM$mgi_symbol <- NULL
+
+hmcol <- colorRampPalette(brewer.pal(9, "YlGnBu"))(100)
+# heatmap.2(log(as.matrix(counttableNorm.sciencepapergenes[,2:13])+1), col = hmcol, Rowv = TRUE, Colv = FALSE, scale="none",dendrogram="both", trace="none", margin=c(10, 6),labRow = counttableNorm.sciencepapergenes$Row.names)
+
+heatmap.2(log(as.matrix(sciencepaperchannelsCPMM[,1:15])+1), col = hmcol, Rowv = TRUE, Colv = FALSE, scale="none",dendrogram="both", trace="none", margin=c(10, 6),labRow = sciencepaperchannelsCPMM$Row.names)
+
+tmp = log(as.matrix(sciencepaperchannelsCPMM[,1:15])+1)
+tmp1 <-tmp[(apply(tmp,1,sum) > 0),]
+
+#colannotation <- data.frame(colnames(tmp1))
+#names(colannotation) <- "Dataset"
+#colannotation$Stage <- substr(colannotation$Dataset, 1, nchar(as.character(colannotation$Dataset)) -2)
+#colannotation$Source <- substr(colannotation$Dataset, nchar(as.character(colannotation$Dataset)) -1 , nchar(as.character(colannotation$Dataset)) -1)
+#colannotation$Dataset <- NULL
+
+
+heatmap3(tmp1, Rowv = TRUE, Colv=TRUE,ColSideCut = 0.2,ColSideWidth=0.8, col=colorRampPalette(c("green","black", "red"))(1024),legendfun=function() showLegend(legend=c("Low", "High"),col=c("green","red")))
+
+
+
+
+#ggplot(counttableNorm.sciencepapergenes.melt,aes(x=variable,y=mgi_symbol,fill=log(value+.1))) + geom_tile() + labs(x="Stage",y="Gene")+scale_x_discrete(expand=c(0,0))+ scale_fill_gradient(name="log(cpmm+.1)",  low="#edf8b1", high="#2c7fb8")+theme_bw()+theme(axis.ticks=element_blank(),legend.position="bottom") + geom_vline(xintercept=3.5,linetype="dotted")	+ geom_vline(xintercept=9.5,linetype="dotted")	+ geom_vline(xintercept=6.5)	 		+ geom_vline(xintercept=12.5)
+
+# probe label colours ,RowAxisColors=1
+# ,RowSideColors=RowSideColors - colour boxes on the left of the rows
+```
+
+
+```{r ImmunegenesCPMM}
+# GO:0006954 overlaps with GO:0006955 by only 82 genes, with 200 unique to the 1st, and 190 unique to the second
+
+GO0006954 <- read.csv("GO0006954.txt", header = FALSE)
+
+GO0006955 <- read.csv("GO0006955.txt", header = FALSE)
+
+GO0006954_CPMM <- subset.data.frame(cpmTotalP7P90, cpmTotalP7P90$Row.names %in% GO0006954$V1)
+GO0006955_CPMM <- subset.data.frame(cpmTotalP7P90, cpmTotalP7P90$Row.names %in% GO0006955$V1)
+GO0006954_CPMM$mgi_symbol[duplicated(GO0006954_CPMM$mgi_symbol)]
+GO0006955_CPMM$mgi_symbol[duplicated(GO0006955_CPMM$mgi_symbol)]
+
+GO0006954_CPMM_nonzero <- GO0006954_CPMM[(apply(as.matrix(GO0006954_CPMM[,2:16]),1,sum) > 0),]
+GO0006955_CPMM_nonzero <- GO0006955_CPMM[(apply(as.matrix(GO0006955_CPMM[,2:16]),1,sum) > 0),]
+GO0006954_CPMM_nonzero$mgi_symbol[duplicated(GO0006954_CPMM_nonzero$mgi_symbol)]
+GO0006955_CPMM_nonzero$mgi_symbol[duplicated(GO0006955_CPMM_nonzero$mgi_symbol)]
+
+row.names(GO0006954_CPMM_nonzero) <- make.names(GO0006954_CPMM_nonzero$mgi_symbol, unique = TRUE)
+row.names(GO0006955_CPMM_nonzero) <- make.names(GO0006955_CPMM_nonzero$mgi_symbol, unique = TRUE)
+
+
+GO0006954_CPMM_log <-log(as.matrix(GO0006954_CPMM_nonzero[,2:16])+1)
+GO0006955_CPMM_log <-log(as.matrix(GO0006955_CPMM_nonzero[,2:16])+1)
+row.names(GO0006954_CPMM_log) <- row.names(GO0006954_CPMM_nonzero)
+row.names(GO0006955_CPMM_log) <- row.names(GO0006955_CPMM_nonzero)
+
+
+
+
+
+
+#colannotation <- data.frame(colnames(tmp1))
+#names(colannotation) <- "Dataset"
+#colannotation$Stage <- substr(colannotation$Dataset, 1, nchar(as.character(colannotation$Dataset)) -2)
+#colannotation$Source <- substr(colannotation$Dataset, nchar(as.character(colannotation$Dataset)) -1 , nchar(as.character(colannotation$Dataset)) -1)
+#colannotation$Dataset <- NULL
+
+heatmap.2(GO0006954_CPMM_log, Rowv = TRUE, Colv=TRUE,col=colorRampPalette(c("green","black", "red"))(1024))
+
+
+heatmap3(GO0006954_CPMM_log, Rowv = TRUE, Colv=TRUE, method="complete", ColSideCut = 0.1,ColSideWidth=0.8, col=colorRampPalette(c("green","black", "red"))(1024),legendfun=function() showLegend(legend=c("Low", "High"),col=c("green","red")))
+
+heatmap3(GO0006955_CPMM_log, Rowv = TRUE, Colv=TRUE,ColSideCut = 0.1,ColSideWidth=0.8, col=colorRampPalette(c("green","black", "red"))(1024),legendfun=function() showLegend(legend=c("Low", "High"),col=c("green","red")))
+
+# Filter to be expressed in >= 3 datasets at 0.1 cpmm
+GO0006954_isexpr <- rowSums(apply(as.matrix(GO0006954_CPMM_nonzero[,2:16]),2,function(x) x > 0.1 )) >= 3
+GO0006954_expr <- GO0006954_CPMM_log[GO0006954_isexpr,]
+
+GO0006955_isexpr <- rowSums(apply(as.matrix(GO0006955_CPMM_nonzero[,2:16]),2,function(x) x > 0.1 )) >= 3
+GO0006955_expr <- GO0006955_CPMM_log[GO0006955_isexpr,]
+
+
+
+heatmap3(GO0006954_expr, Rowv = TRUE, Colv=TRUE, method="complete", ColSideCut = 0.1,ColSideWidth=0.8, col=colorRampPalette(c("green","black", "red"))(1024),legendfun=function() showLegend(legend=c("Low", "High"),col=c("green","red")))
+
+heatmap3(GO0006955_expr, Rowv = TRUE, Colv=TRUE, method="complete", ColSideCut = 0.1,ColSideWidth=0.8, col=colorRampPalette(c("green","black", "red"))(1024),legendfun=function() showLegend(legend=c("Low", "High"),col=c("green","red")))
+
+
+# Now without labelling the individual genes
+
+heatmap3(GO0006954_expr, Rowv = TRUE, Colv=TRUE, method="complete", ColSideCut = 0.1,ColSideWidth=0.8, labRow = "", col=colorRampPalette(c("green","black", "red"))(1024),legendfun=function() showLegend(legend=c("Low", "High"),col=c("green","red")))
+
+heatmap3(GO0006955_expr, Rowv = TRUE, Colv=TRUE, method="complete", ColSideCut = 0.1,ColSideWidth=0.8, labRow = "", col=colorRampPalette(c("green","black", "red"))(1024),legendfun=function() showLegend(legend=c("Low", "High"),col=c("green","red")))
+
+```
+
+
+
+
+```{r SueliGenesOctober}
+suelichannels <- read.csv("161028_SueliChannleList.csv")
+# had to change Scn2a to Scn2a1 and Kcna8 to Kcna10 as these are their symbol in my annotaiton for some reason and the correct MGI symbol respectively
+suelichannels_CPMM <- subset.data.frame(cpmTotalP7P90, cpmTotalP7P90$mgi_symbol %in% suelichannels$Gene, select=c("Row.names", "E13.5B1", "E13.5B2", "E13.5B3", "E13.5S1", "E13.5S2", "E13.5S3", "P7S1", "P7S2", "P7S3", "P7B1", "P7B2", "P7B3",  "mgi_symbol"))
+suelichannels$color <- brewer.pal(length(levels(suelichannels$Category)), "Dark2")[suelichannels$Category]
+
+suelichannels_CPMM_nonzero <- suelichannels_CPMM[(apply(as.matrix(suelichannels_CPMM[,2:13]),1,sum) > 0),]
+require(gdata)
+suelichannels_CPMM_nonzero$mgi_symbol <- reorder.factor(suelichannels_CPMM_nonzero$mgi_symbol, new.order=suelichannels$Gene)
+
+rownames(suelichannels_CPMM_nonzero) <- suelichannels_CPMM_nonzero$mgi_symbol
+
+heatmap3(suelichannels_CPMM_nonzero[,2:13], Rowv = TRUE, Colv=TRUE, method="complete", ColSideCut = 0.05,ColSideWidth=0.8, col=colorRampPalette(c("#2c7bb6", "#ffffbf", "#d7191c"))(1024),distfun = function(x) as.dist(1 - cor(t(x), method = "spearman", use = "pa")),legendfun=function() showLegend(legend=c("Low expression", "High expression"),col=c("green","red")), RowSideColors = 
+           suelichannels[match(suelichannels_CPMM_nonzero$mgi_symbol, suelichannels$Gene),"color"], RowAxisColors=1
+           )
+#par(lend = 0)           # square line ends for the color legend
+legend("left",      # location of the legend on the heatmap plot
+    legend = unique(suelichannels$Category), # category labels
+    bty = "n",
+    col = unique(suelichannels$color), # color key
+    lty= 1,             # line style
+    lwd = 10            # line width
+)
+
+```
+
+
+
+
+```{r GoncaloGenesOctoberMyelination}
+#goncalogenes <- c("Slc1a3", "Eomes", "Gbx2", "Bdnf", "Gdnf", "Neurog1", "Tbx1", "Emx1", "Pax6", "Sox10", "Sox9", "Sox2", "Malat1", "Sox2ot", "Rn7sk", "Foxg1", "Banff", "Fgf2", "Gfap", "Mecp2", "Pdgfa", "Apoe", "Cldn11", "Cnp", "Egr2", "Erbb3", "Mag", "Mal", "Mbp", "Mobp", "Mog", "Neu4", "Nrg1", "Olig2", "Omg", "Pdgfra", "Plp1", "Pmp22", "Pten", "Qk", "Ugt8a", "Aqp4", "Tubb3", "Cspg4", "Enpp6")
+
+
+
+goncalogenes <- c("Slc1a3", "Eomes", "Gbx2",  "Neurog1", "Tbx1", "Emx1", "Pax6", "Sox10", "Sox9", "Sox2",  "Foxg1", "Banff", "Fgf2", "Pdgfa", "Apoe", "Cldn11", "Cnp",  "Erbb3", "Mag", "Mal", "Mbp", "Mobp", "Mog", "Neu4", "Nrg1", "Olig2", "Omg", "Pdgfra", "Plp1", "Pmp22", "Pten", "Qk", "Ugt8a", "Tubb3", "Cspg4", "Enpp6")
+
+goncalogenes_CPMM <- subset.data.frame(cpmTotalP7P90, cpmTotalP7P90$mgi_symbol %in% goncalogenes, select=c("Row.names", "E13.5B1", "E13.5B2", "E13.5B3", "E13.5S1", "E13.5S2", "E13.5S3", "P7S1", "P7S2", "P7S3", "P7B1", "P7B2", "P7B3",  "mgi_symbol"))
+
+
+rownames(goncalogenes_CPMM) <- goncalogenes_CPMM$mgi_symbol
+
+heatmap3(goncalogenes_CPMM[,2:13], Rowv = TRUE, Colv=TRUE, method="complete", ColSideCut = 0.05,ColSideWidth=0.8, col= colorRampPalette(c("#2c7bb6", "#ffffbf", "#d7191c"))(1024),distfun = function(x) as.dist(1 - cor(t(x), method = "spearman", use = "pa")), balanceColor = TRUE)
+#par(lend = 0)           # square line ends for the color legend
+
+
+```
+
+```{r E13.5enrichedGenes}
+enrichedgenese13.5a3 <- subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$logFC < 0, select = "genes")$genes
+
+
+enrichedgenese13.5a3_CPMM <- subset.data.frame(cpmTotalP7P90, (cpmTotalP7P90$Row.names %in% enrichedgenese13.5a3) & (cpmTotalP7P90$mgi_symbol %ni% c("Il11ra2", "Gbp6", "")), select=c("Row.names", "E13.5B1", "E13.5B2", "E13.5B3", "E13.5S1", "E13.5S2", "E13.5S3", "P7S1", "P7S2", "P7S3", "P7B1", "P7B2", "P7B3",  "mgi_symbol"))
+
+
+rownames(enrichedgenese13.5a3_CPMM) <- enrichedgenese13.5a3_CPMM$mgi_symbol
+
+heatmap3(enrichedgenese13.5a3_CPMM[,2:13], Rowv = TRUE, Colv=TRUE, method="complete", ColSideCut = 0.05,ColSideWidth=0.8, col=colorRampPalette(c("#2c7bb6", "#ffffbf", "#d7191c"))(1024),distfun = function(x) as.dist(1 - cor(t(x), method = "spearman", use = "pa")), balanceColor = TRUE)
+#par(lend = 0)           # square line ends for the color legend
+
+```
+Downloaded list of top 100 cage regions associated with central nervous system pericytes by fantom. Overlay them with gencode comprehensive v. using UCSC. Then used biomart to convert gene identifiers to human, and looked for the MGI genes in mouse (also collapsed them to 18 unique genes).
+
+```{r PericyteGenes}
+pericytegenes <- read.csv("CL0002575pericyteFANTOM.HumanGeneNamesUnique.txt",  header = FALSE)
+
+pericytegenes_CPMM <- subset.data.frame(cpmTotalP7P90, (cpmTotalP7P90$mgi_symbol %in% pericytegenes$V1) , select=c("Row.names", "E13.5B1", "E13.5B2", "E13.5B3", "E13.5S1", "E13.5S2", "E13.5S3", "P7S1", "P7S2", "P7S3", "P7B1", "P7B2", "P7B3",  "mgi_symbol"))
+
+
+rownames(pericytegenes_CPMM) <- pericytegenes_CPMM$mgi_symbol
+
+heatmap3(pericytegenes_CPMM[,2:13], Rowv = TRUE, Colv=TRUE, method="complete", ColSideCut = 0.05,ColSideWidth=0.8, col=colorRampPalette(c("#2c7bb6", "#ffffbf", "#d7191c"))(1024),distfun = function(x) as.dist(1 - cor(t(x), method = "spearman", use = "pa")), balanceColor = TRUE)
+  #par(lend = 0)           # square line ends for the color legend
+
+```
+
+
+```{r CollagenGenes}
+# collagen fibril organization
+
+
+collagenfibrilorganisation_CPMM <- subset.data.frame(cpmTotalP7P90, (cpmTotalP7P90$Row.names %in% 
+  unlist(strsplit(subset.data.frame(GOfromDB.final, GOfromDB.final$go_id == "GO:0030199")$genes, split = ","))) , # collagen fibril organization
+  select=c("Row.names", "E13.5B1", "E13.5B2", "E13.5B3", "E13.5S1", "E13.5S2", "E13.5S3", "P7S1", "P7S2", "P7S3", "P7B1", "P7B2", "P7B3",  "mgi_symbol"))
+rownames(collagenfibrilorganisation_CPMM) <- collagenfibrilorganisation_CPMM$mgi_symbol
+heatmap3(collagenfibrilorganisation_CPMM[,2:13], Rowv = TRUE, Colv=TRUE, method="complete", ColSideCut = 0.05,ColSideWidth=0.8, col=colorRampPalette(c("#2c7bb6", "#ffffbf", "#d7191c"))(1024),distfun = function(x) as.dist(1 - cor(t(x), method = "spearman", use = "pa")), balanceColor = TRUE)
+
+
+# Collagen trimer
+collagentrimer_CPMM <- subset.data.frame(cpmTotalP7P90, (cpmTotalP7P90$Row.names %in% 
+  unlist(strsplit(subset.data.frame(GOfromDB.final, GOfromDB.final$go_id == "GO:0005581")$genes, split = ","))) & rowSums(cpmTotalP7P90[,2:13]) > 0 , # collagen fibril organization
+  select=c("Row.names", "E13.5B1", "E13.5B2", "E13.5B3", "E13.5S1", "E13.5S2", "E13.5S3", "P7S1", "P7S2", "P7S3", "P7B1", "P7B2", "P7B3",  "mgi_symbol"))
+rownames(collagentrimer_CPMM) <- collagentrimer_CPMM$mgi_symbol
+heatmap3(collagentrimer_CPMM[,2:13], Rowv = TRUE, Colv=TRUE, method="complete", ColSideCut = 0.05,ColSideWidth=0.8, col=colorRampPalette(c("#2c7bb6", "#ffffbf", "#d7191c"))(1024),distfun = function(x) as.dist(1 - cor(t(x), method = "spearman", use = "pa")), balanceColor = TRUE)
+```
+
+
+
+```{r NormAndExploreRandomGenes}
+randomgenesofinterest2014 <- c("Slc1a3", "Olig2", "Qk", "Eomes", "Gbx2", "Bdnf", "Gdnf", "Neurog1", "Pdgfra", "Padi2", "Padi1", "Tbx1", "Emx1", "Pax6", "Sox10", "Sox9", "Sox2", "Malat1", "Sox2ot", "Rn7sk", "Foxg1")
+
+myelination <- c("Ccl22", "Ahcy", "Apoe", "Arhgef10", "Arsa", "Basp1", "Bdnf", "Calm1", "Canx", "Cldn11", "Cnp", "Cntn1", "Cntn2", "Tyrobp", "Egf", "Egfr", "Egr2", "Eif2b1", "Eif2b2", "Eif2b3", "Eif2b4", "Eif2b5", "Erbb2", "Erbb3", "Erbb4", "Fabp7", "Fga", "Fgf1", "Fgf13", "Fgf14", "Fgf18", "Fgf2", "Fgf20", "Fgf22", "Fgfr1", "Fgfr2", "Fgfr3", "Fgfr4", "Gal3st1", "Galc", "Gap43", "Gdnf", "Gfap", "Gfra1", "Gjc2", "Gjb1", "Gpm6a", "Gpm6b", "Gsn", "Inpp1", "Inpp4a", "Inpp4b", "Inpp5a", "Inpp5d", "Inppl1", "Irs1", "Jag1", "Lif", "Lsamp", "Mag", "Mal", "Manba", "Mapt", "Mat1a", "Mbp", "Mecp2", "Mitf", "Mobp", "Mog", "Mpz", "Mpzl1", "Myt1", "Myt2", "Ndrg1", "Neu4", "Ngf", "Ngfr", "Notch1", "Nrg1", "Nrg2", "Nrn1", "Olig2", "Omg", "Pax3", "Pdgfa", "Pdgfra", "Inpp5j", "Pik3c2a", "Pik3c2b", "Pik3c2g", "Pik3c3", "Pik3ca", "Pik3cb", "Pik3cd", "Pik3cg", "Pik3r1", "Pik3r2", "Pik3r3", "Pik3r4", "Pi4ka", "Pi4kb", "Pip5k1a", "Pip5k1b", "Pip5k1c", "Pip4k2a", "Pip4k2b", "Plcb1", "Plcb3", "Plce1", "Plcg1", "Plp1", "Pmp22", "Pou3f1", "Prkca", "Prkcg", "Proz", "Prx", "Psap", "Pten", "Ptprz1", "Qk", "Rela", "Ret", "Rho", "Rtn4", "Rtn4r", "Sod2", "Sox10", "Spp1", "Synj1", "Trf", "Tfrc", "Pllp", "Trem2", "Ttr", "Tyrp1", "Ugt8a")
+
+
+```
+
+
+
+```{r CellTypeMarkersGlobalHeatmap}
+celltypemarkersbig <-subset.data.frame(annotation, annotation$mgi_symbol %in% c("Gfap", "Aldh1l1", "Slc1a3", "Aqp4", "Tubb3", "Stmn2", "Snap25", "Eno2", "Syn1", "Pdgfra", "Cspg4", "Enpp6", "Nfasc", "Plp1", "Mog", "Mbp", "Mobp","Ccl3", "Itgam", "Tnf", "Cldn5", "Flt1", "Esam"), select="ensembl_gene_id" )
+celltypemarkersbig.class <- NULL
+celltypemarkersbig.class$gene <- c("Gfap", "Aldh1l1", "Slc1a3", "Aqp4", "Tubb3", "Stmn2", "Snap25", "Eno2", "Syn1", "Pdgfra", "Cspg4","Olig2", "Enpp6", "Nfasc", "Plp1", "Mog", "Mbp", "Mobp","Ccl3", "Itgam", "Tnf", "Cldn5", "Flt1", "Esam")
+celltypemarkersbig.class <- data.frame(celltypemarkersbig.class)
+celltypemarkersbig.class$tissue <- c(rep("Astro", 4), rep("Neu", 5),rep("Olig", 9),rep("Micro", 3), rep("Endo", 3))
+
+counttableNorm.celltypemarkersbig <- subset.data.frame(counttableNorm.anno, counttableNorm.anno$Row.names %in% celltypemarkersbig$ensembl_gene_id)
+counttableNorm.celltypemarkersbig$gene_biotype <- NULL
+counttableNorm.celltypemarkersbig$Row.names <- NULL
+counttableNorm.celltypemarkersbig$description <- NULL
+row.names(counttableNorm.celltypemarkersbig) <- counttableNorm.celltypemarkersbig$mgi_symbol
+counttableNorm.celltypemarkersbig$mgi_symbol <- NULL
+counttableNorm.celltypemarkersbig.merged <- merge.data.frame(counttableNorm.celltypemarkersbig, celltypemarkersbig.class, by.x=0, by.y="gene")
+#
+counttableNorm.celltypemarkersbig.merged.melt <- melt(counttableNorm.celltypemarkersbig.merged)
+counttableNorm.celltypemarkersbig.merged.melt$Row.names <- as.character(counttableNorm.celltypemarkersbig.merged.melt$Row.names)
+counttableNorm.celltypemarkersbig.merged.melt$tissue <- as.numeric(as.factor(counttableNorm.celltypemarkersbig.merged.melt$tissue), ordered = TRUE)
+counttableNorm.celltypemarkersbig.merged.melt$Row.names <- reorder(counttableNorm.celltypemarkersbig.merged.melt$Row.names, counttableNorm.celltypemarkersbig.merged.melt$tissue,order = is.ordered(counttableNorm.celltypemarkersbig.merged.melt$Row.names))
+#hmcol <- colorRampPalette(brewer.pal(9, "PuRd"))(100)
+#heatmap.2(log(as.matrix(counttableNorm.celltypemarkersbig.merged[,2:13])+1), col = hmcol, Rowv = TRUE, Colv = FALSE, scale="none",dendrogram="none", trace="none", margin=c(10, 6),labRow = counttableNorm.celltypemarkersbig.merged$Row.names)
+
+
+ggplot(counttableNorm.celltypemarkersbig.merged.melt,aes(x=variable,y=Row.names,fill=log(value+.1))) + geom_tile() + labs(x="Stage",y="Gene")+scale_x_discrete(expand=c(0,0))+ scale_fill_gradient(name="log(cpmm+.1)",  low="#edf8b1", high="#2c7fb8")+theme_bw()+theme(axis.ticks=element_blank(),legend.position="bottom") + geom_hline(yintercept=4.5)+ geom_hline(yintercept=7.5)	+ geom_hline(yintercept=10.5)	+ geom_hline(yintercept=15.5)		+ geom_vline(xintercept=3.5,linetype="dotted")			+ geom_vline(xintercept=9.5,linetype="dotted")	+ geom_vline(xintercept=6.5)
+
+
+```
+
+
+```{r GoncaloTF}
+goncaloTFs <- c("Lhx1", "Lhx5", "Hoxb8", "Hoxd3", "Hoxb2", "Hoxb3", "Hoxa3", "Lmx1a", "Wnt1", "Pax3", "Hoxb6", "Hoxb5", "Hoxd3", "Hoxb9", "Lhx1", "Hoxd8", "Hoxa11", "Hoxa13", "Nkx2-1", "Dlx1", "Dlx2", "Lhx6", "Arx", "Lhx5", "Uncx")
+
+goncaloTFs_CPMM <- subset.data.frame(cpmTotalP7P90, cpmTotalP7P90$mgi_symbol %in% goncaloTFs,
+  select=c("Row.names", "E13.5B1", "E13.5B2", "E13.5B3", "E13.5S1", "E13.5S2", "E13.5S3", "P7S1", "P7S2", "P7S3", "P7B1", "P7B2", "P7B3",  "mgi_symbol"))
+rownames(goncaloTFs_CPMM) <- goncaloTFs_CPMM$mgi_symbol
+heatmap3(goncaloTFs_CPMM[,2:13], Rowv = TRUE, Colv=TRUE, method="complete", ColSideCut = 0.07,ColSideWidth=0.8, col=colorRampPalette(c("#2c7bb6", "#ffffbf", "#d7191c"))(1024), balanceColor = TRUE)
+
+```
+
+
+
+
+
+# Paste the data together for easier parsing and pull out TF, Chr, and other cool stuff
+
+```{r PasteResults}
+tmpEBvsS <- EBvsS.anno
+tmpEBvsS$comparison <- "EBvsS"
+tmpPBvsS <- PBvsS.anno
+tmpPBvsS$comparison <- "PBvsS"
+tmpBvsS <- BvsS.anno
+tmpBvsS$comparison <- "BvsS"
+tmpBPvsE <- BPvsE.anno
+tmpBPvsE$comparison <- "BPvsE"
+tmpSPvsE <- SPvsE.anno
+tmpSPvsE$comparison <- "SPvsE"
+tmpPvsE <- PvsE.anno
+tmpPvsE$comparison <- "PvsE"
+completeResults <- rbind(tmpEBvsS, tmpPBvsS, tmpBvsS, tmpBPvsE, tmpSPvsE, tmpPvsE)
+rm(tmpEBvsS, tmpPBvsS, tmpBvsS, tmpBPvsE, tmpSPvsE, tmpPvsE)
+write.table(completeResults, "completeresults.csv", sep="\t", quote=FALSE, row.names=FALSE)
+```
+
+```{r GetTFsChromsEtc}
+# FANTOM
+fantom5 <- read.csv("~/Documents/01_MyProjects/DataTablesForR/mmuFANTOM5.csv")
+table(fantom5$Symbol %in% annotation$mgi_symbol)
+# DBD - a total of 2548 unique ENSMUSPs in there
+dbd <- read.csv("~/Documents/01_MyProjects/DataTablesForR/mmuDBD_TF.txt", sep="\t", skip=1, header=FALSE)
+annotation.dbd <- getBM(attributes=c( "ensembl_peptide_id","mgi_symbol"), filters = "ensembl_peptide_id", values=dbd$V2, mart=ensembl)
+# AnimalTFBD
+tfdbTF <- read.csv("~/Dropbox/Documents/01_MyProjects/DataTablesForR/mmu_transcription_factors_gene_list.txt", sep="\t")
+tfdbTF.anno <- merge.data.frame(tfdbTF, annotation, by.x="Gene.id", by.y="ensembl_gene_id")
+rm(tfdbTF)
+tfdbTFc <- read.csv("~/Dropbox/Documents/01_MyProjects/DataTablesForR/mmu_transcription_co-factors_gene_list.txt", sep="\t", header=FALSE, col.names=c("Gene.id", "Class"))
+tfdbTFc.anno <- merge.data.frame(tfdbTFc, annotation, by.x="Gene.id", by.y="ensembl_gene_id")
+tfdbChromatin <- read.csv("~/Dropbox/Documents/01_MyProjects/DataTablesForR/mmu_chromatin_remodeling_factors_gene_list.txt", sep="\t", header=FALSE, col.names=c("Gene.id", "Class"))
+
+
+# others later
+tf <- unique(c(as.character(fantom5$Symbol), annotation.dbd$mgi_symbol, tfdbTF.anno$mgi_symbol))
+tf <- tf[tf!=""]
+rm(fantom5, dbd, tfdbTF.anno, tfdbTFc)
+```
+
+
+```{r PullOutTFsChromsEtc}
+tfsig <- subset.data.frame(completeResults, completeResults$mgi_symbol %in% tf)
+tfcofactorsig <- subset.data.frame(completeResults, completeResults$genes %in% tfdbTFc.anno$Gene.id)
+chromatinsig <- subset.data.frame(completeResults, completeResults$genes %in% tfdbChromatin$Gene.id)
+
+write.csv(tfsig, file="tfsig.csv", quote=TRUE, row.names=FALSE)
+write.csv(tfcofactorsig, file="tfcofactorsig.csv", quote=TRUE, row.names=FALSE)
+write.csv(chromatinsig , file="chromatinsig.csv", quote=TRUE, row.names=FALSE)
+```
+
+
+
+```{r PscanPrep}
+saveRDS(counttable, "counttable.Rds")
+#library(biomaRt)
+#ensembl=useMart(host="www.ensembl.org", biomart="ENSEMBL_MART_ENSEMBL", dataset = "mmusculus_gene_ensembl")
+#annotation2 <- getBM(attributes=c("ensembl_gene_id", "refseq_mrna"), filters = "ensembl_gene_id", values=row.names(counttable), mart=ensembl)
+annotation2 <- readRDS("annotation2.Rds")
+
+write.table(unique(merge.data.frame(subset.data.frame(BP7vsETotal.anno, BP7vsETotal.anno$logFC > 0), annotation2,by.x = "genes", by.y = "ensembl_gene_id")$refseq_mrna),"./pscan/BP7vsETotal.anno.up.txt", row.names = FALSE, quote = FALSE, col.names = FALSE, sep = "\t")
+write.table(unique(merge.data.frame(subset.data.frame(BP7vsETotal.anno, BP7vsETotal.anno$logFC < 0), annotation2,by.x = "genes", by.y = "ensembl_gene_id")$refseq_mrna),"./pscan/BP7vsETotal.anno.dw.txt", row.names = FALSE, quote = FALSE, col.names = FALSE, sep = "\t")
+write.table(unique(merge.data.frame(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$logFC > 0), annotation2,by.x = "genes", by.y = "ensembl_gene_id")$refseq_mrna),"./pscan/BvsSearlyTotal.anno.up.txt", row.names = FALSE, quote = FALSE, col.names = FALSE, sep = "\t")
+write.table(unique(merge.data.frame(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$logFC < 0), annotation2,by.x = "genes", by.y = "ensembl_gene_id")$refseq_mrna),"./pscan/BvsSearlyTotal.anno.dw.txt", row.names = FALSE, quote = FALSE, col.names = FALSE, sep = "\t")
+write.table(unique(merge.data.frame(subset.data.frame(EBvsSTotal.anno, EBvsSTotal.anno$logFC > 0), annotation2,by.x = "genes", by.y = "ensembl_gene_id")$refseq_mrna),"./pscan/EBvsSTotal.anno.up.txt", row.names = FALSE, quote = FALSE, col.names = FALSE, sep = "\t")
+write.table(unique(merge.data.frame(subset.data.frame(EBvsSTotal.anno, EBvsSTotal.anno$logFC < 0), annotation2,by.x = "genes", by.y = "ensembl_gene_id")$refseq_mrna),"./pscan/EBvsSTotal.anno.dw.txt", row.names = FALSE, quote = FALSE, col.names = FALSE, sep = "\t")
+write.table(unique(merge.data.frame(subset.data.frame(P7BvsSTotal.anno, P7BvsSTotal.anno$logFC > 0), annotation2,by.x = "genes", by.y = "ensembl_gene_id")$refseq_mrna),"./pscan/P7BvsSTotal.anno.up.txt", row.names = FALSE, quote = FALSE, col.names = FALSE, sep = "\t")
+write.table(unique(merge.data.frame(subset.data.frame(P7BvsSTotal.anno, P7BvsSTotal.anno$logFC < 0), annotation2,by.x = "genes", by.y = "ensembl_gene_id")$refseq_mrna),"./pscan/P7BvsSTotal.anno.dw.txt", row.names = FALSE, quote = FALSE, col.names = FALSE, sep = "\t")
+write.table(unique(merge.data.frame(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$logFC > 0), annotation2,by.x = "genes", by.y = "ensembl_gene_id")$refseq_mrna),"./pscan/PvsEearlyTotal.anno.up.txt", row.names = FALSE, quote = FALSE, col.names = FALSE, sep = "\t")
+write.table(unique(merge.data.frame(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$logFC < 0), annotation2,by.x = "genes", by.y = "ensembl_gene_id")$refseq_mrna),"./pscan/PvsEearlyTotal.anno.dw.txt", row.names = FALSE, quote = FALSE, col.names = FALSE, sep = "\t")
+write.table(unique(merge.data.frame(subset.data.frame(SP7vsETotal.anno, SP7vsETotal.anno$logFC > 0), annotation2,by.x = "genes", by.y = "ensembl_gene_id")$refseq_mrna),"./pscan/SP7vsETotal.anno.up.txt", row.names = FALSE, quote = FALSE, col.names = FALSE, sep = "\t")
+write.table(unique(merge.data.frame(subset.data.frame(SP7vsETotal.anno, SP7vsETotal.anno$logFC < 0), annotation2,by.x = "genes", by.y = "ensembl_gene_id")$refseq_mrna),"./pscan/SP7vsETotal.anno.dw.txt", row.names = FALSE, quote = FALSE, col.names = FALSE, sep = "\t")
+
+```
+
+```{r OpposumPrep}
+write.table(subset.data.frame(EBvsSTotal.anno, EBvsSTotal.anno$logFC > 0, select = c("genes")), "EBvsSTotal.anno.up.csv", row.names = FALSE, quote = FALSE, col.names = FALSE, sep = "\t")
+write.table(subset.data.frame(EBvsSTotal.anno, EBvsSTotal.anno$logFC < 0, select = c("genes")), "EBvsSTotal.anno.dw.csv", row.names = FALSE, quote = FALSE, col.names = FALSE, sep = "\t")
+write.table(subset.data.frame(P7BvsSTotal.anno, P7BvsSTotal.anno$logFC > 0, select = c("genes")), "P7BvsSTotal.anno.up.csv", row.names = FALSE, quote = FALSE, col.names = FALSE, sep = "\t")
+write.table(subset.data.frame(P7BvsSTotal.anno, P7BvsSTotal.anno$logFC < 0, select = c("genes")), "P7BvsSTotal.anno.dw.csv", row.names = FALSE, quote = FALSE, col.names = FALSE, sep = "\t")
+write.table(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$logFC > 0, select = c("genes")), "BvsSearlyTotal.anno.up.csv", row.names = FALSE, quote = FALSE, col.names = FALSE, sep = "\t")
+write.table(subset.data.frame(BvsSearlyTotal.anno, BvsSearlyTotal.anno$logFC < 0, select = c("genes")), "BvsSearlyTotal.anno.dw.csv", row.names = FALSE, quote = FALSE, col.names = FALSE, sep = "\t")
+write.table(subset.data.frame(BP7vsETotal.anno, BP7vsETotal.anno$logFC > 0, select = c("genes", "logFC")), "BP7vsETotal.anno.up.csv", row.names = FALSE, quote = FALSE, col.names = FALSE, sep = "\t")
+write.table(subset.data.frame(BP7vsETotal.anno, BP7vsETotal.anno$logFC < 0, select = c("genes", "logFC")), "BP7vsETotal.anno.dw.csv", row.names = FALSE, quote = FALSE, col.names = FALSE, sep = "\t")
+write.table(subset.data.frame(SP7vsETotal.anno, SP7vsETotal.anno$logFC > 0, select = c("genes", "logFC")), "SP7vsETotal.anno.up.csv", row.names = FALSE, quote = FALSE, col.names = FALSE, sep = "\t")
+write.table(subset.data.frame(SP7vsETotal.anno, SP7vsETotal.anno$logFC < 0, select = c("genes", "logFC")), "SP7vsETotal.anno.dw.csv", row.names = FALSE, quote = FALSE, col.names = FALSE, sep = "\t")
+write.table(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$logFC > 0, select = c("genes", "logFC")), "PvsEearlyTotal.anno.up.csv", row.names = FALSE, quote = FALSE, col.names = FALSE, sep = "\t")
+write.table(subset.data.frame(PvsEearlyTotal.anno, PvsEearlyTotal.anno$logFC < 0, select = c("genes", "logFC")), "PvsEearlyTotal.anno.dw.csv", row.names = FALSE, quote = FALSE, col.names = FALSE, sep = "\t")
+
+```
+
+
+
+
+
+
+```{r LarsonPaperGenes}
+potassium <- c("Kcnj10",  "Kcnmb4",  "Kcnd2",  "Kcna6",  "Kcnk1",  "Kcnd3",  "Kcnk2",  "Kcnq2",  "Kcnc3",  "Kcnab2",  "Kcnk10",  "Kcnj16",  "Kcnb1",  "Kcnma1",  "Kcnh2",  "Kcnn1",  "Kcna2",  "Kcnab3",  "Kcne4",  "Kcnab1",  "Kcnc1",  "Kcnh8",  "Kcnn2",  "Kcna3",  "Kcnh3",  "Kcnj3",  "Kcna1",  "Kcnh5",  "Kcnd1",  "Kcnq3",  "Kcnc4",  "Kcnf1")
+sodium <- c("Nalcn",  "Scn1b",  "Scn3b",  "Scn3a",  "Scn2a1",  "Scn8a",  "Scn1a",  "Scn2b")
+calcium <- c("Cacng4",  "Cacng7",  "Cacnb3",  "Cacng8",  "Cacng5",  "Cacnb4",  "Cacna2d3",  "Cacna1d",  "Cacna1g",  "Cacnb1",  "Cacna2d1",  "Cacna1c",  "Cacna1a",  "Cacna1e",  "Cacna1h",  "Cacna2d2",  "Cacna1h")
+hcntrp <- c("Hcn2",  "Hcn3",  "Trpm7",  "Trpc1",  "Trpm3") #Trpc2 not expressed so excluded
+glutamate <- c("Gria2",  "Gria3",  "Grik5",  "Gria4",  "Grid1",  "Grin3a",  "Grik4",  "Grin1",  "Grik3",  "Grik2",  "Grm5",  "Grik1",  "Grid2",  "Gria1",  "Grm3",  "Grin2c",  "Grin2d",  "Grm4")
+gaba <- c("Gabbr1",  "Gabra3",  "Gabrb3",  "Gabbr2",  "Gabrg1",  "Gabrb2",  "Gabra2",  "Gabra4",  "Gabrg2",  "Gabra1",  "Gabrb1",  "Gabrg3")
+neuromodulators <- c("P2ry12",  "Adora1",  "Chrna4",  "Glrb",  "P2rx7",  "Adora2b",  "P2rx4",  "P2ry1",  "P2ry6",  "Adrb2",  "Chrna7",  "Chrm1",  "Adra1a",  "Chrnb2",  "P2ry2")
+table(potassium %in% cpmTotalP7P90$mgi_symbol)
+table(sodium %in% cpmTotalP7P90$mgi_symbol)
+table(calcium %in% cpmTotalP7P90$mgi_symbol)
+table(hcntrp %in% cpmTotalP7P90$mgi_symbol)
+table(glutamate %in% cpmTotalP7P90$mgi_symbol)
+table(gaba %in% cpmTotalP7P90$mgi_symbol)
+table(neuromodulators %in% cpmTotalP7P90$mgi_symbol)
+
+potassium_CPMM <- subset.data.frame(cpmTotalP7P90, (cpmTotalP7P90$mgi_symbol %in% potassium) , select=c("Row.names", "E13.5B1", "E13.5B2", "E13.5B3", "E13.5S1", "E13.5S2", "E13.5S3", "P7S1", "P7S2", "P7S3", "P7B1", "P7B2", "P7B3",  "mgi_symbol"))
+rownames(potassium_CPMM) <- potassium_CPMM$mgi_symbol
+heatmap3(potassium_CPMM[,2:13], Rowv = TRUE, Colv=TRUE, method="complete", ColSideCut = 0.07,ColSideWidth=0.8,col=colorRampPalette(c("#2c7bb6", "#ffffbf", "#d7191c"))(1024),distfun = function(x) as.dist(1 - cor(t(x), method = "spearman", use = "pa")), balanceColor = TRUE)
+#par(lend = 0)           # square line ends for the color legend
+
+
+sodium_CPMM <- subset.data.frame(cpmTotalP7P90, (cpmTotalP7P90$mgi_symbol %in% sodium) , select=c("Row.names", "E13.5B1", "E13.5B2", "E13.5B3", "E13.5S1", "E13.5S2", "E13.5S3", "P7S1", "P7S2", "P7S3", "P7B1", "P7B2", "P7B3",  "mgi_symbol"))
+rownames(sodium_CPMM) <- sodium_CPMM$mgi_symbol
+heatmap3(sodium_CPMM[,2:13], Rowv = TRUE, Colv=TRUE, method="complete", ColSideCut = 0.03,ColSideWidth=0.8,col=colorRampPalette(c("#2c7bb6", "#ffffbf", "#d7191c"))(1024),distfun = function(x) as.dist(1 - cor(t(x), method = "spearman", use = "pa")), balanceColor = TRUE)
+
+sodium_CPMM <- subset.data.frame(cpmTotalP7P90, (cpmTotalP7P90$mgi_symbol %in% sodium) , select=c("Row.names", "E13.5B1", "E13.5B2", "E13.5B3", "E13.5S1", "E13.5S2", "E13.5S3", "P7S1", "P7S2", "P7S3", "P7B1", "P7B2", "P7B3",  "mgi_symbol"))
+rownames(sodium_CPMM) <- sodium_CPMM$mgi_symbol
+heatmap3(sodium_CPMM[,2:13], Rowv = TRUE, Colv=TRUE, method="complete", ColSideCut = 0.03,ColSideWidth=0.8,col=colorRampPalette(c("#2c7bb6", "#ffffbf", "#d7191c"))(1024), balanceColor = TRUE)
+
+
+calcium_CPMM <- subset.data.frame(cpmTotalP7P90, (cpmTotalP7P90$mgi_symbol %in% calcium) , select=c("Row.names", "E13.5B1", "E13.5B2", "E13.5B3", "E13.5S1", "E13.5S2", "E13.5S3", "P7S1", "P7S2", "P7S3", "P7B1", "P7B2", "P7B3",  "mgi_symbol"))
+rownames(calcium_CPMM) <- calcium_CPMM$mgi_symbol
+heatmap3(calcium_CPMM[,2:13], Rowv = TRUE, Colv=TRUE, method="complete", ColSideCut = 0.07,ColSideWidth=0.8,col=colorRampPalette(c("#2c7bb6", "#ffffbf", "#d7191c"))(1024),distfun = function(x) as.dist(1 - cor(t(x), method = "spearman", use = "pa")), balanceColor = TRUE)
+
+
+heatmap3(calcium_CPMM[,2:13], Rowv = TRUE, Colv=TRUE, method="complete", ColSideCut = 0.07,ColSideWidth=0.8,col=colorRampPalette(c("#2c7bb6", "#ffffbf", "#d7191c"))(1024),distfun = function(x) as.dist(1 - cor(t(x), method = "spearman", use = "pa")), balanceColor = TRUE)
+
+
+hcntrp_CPMM <- subset.data.frame(cpmTotalP7P90, (cpmTotalP7P90$mgi_symbol %in% hcntrp)  , select=c("Row.names", "E13.5B1", "E13.5B2", "E13.5B3", "E13.5S1", "E13.5S2", "E13.5S3", "P7S1", "P7S2", "P7S3", "P7B1", "P7B2", "P7B3",  "mgi_symbol"))
+rownames(hcntrp_CPMM) <- hcntrp_CPMM$mgi_symbol
+heatmap3(hcntrp_CPMM[,2:13], Rowv = TRUE, Colv=TRUE, method="complete", ColSideCut = 0.07,ColSideWidth=0.8,col=colorRampPalette(c("#2c7bb6", "#ffffbf", "#d7191c"))(1024),distfun = function(x) as.dist(1 - cor(t(x), method = "spearman", use = "pa")), balanceColor = TRUE)
+
+sodium_hcntrp_CPMM <- subset.data.frame(cpmTotalP7P90, (cpmTotalP7P90$mgi_symbol %in% c(hcntrp, sodium))  , select=c("Row.names", "E13.5B1", "E13.5B2", "E13.5B3", "E13.5S1", "E13.5S2", "E13.5S3", "P7S1", "P7S2", "P7S3", "P7B1", "P7B2", "P7B3",  "mgi_symbol"))
+rownames(sodium_hcntrp_CPMM) <- sodium_hcntrp_CPMM$mgi_symbol
+heatmap3(sodium_hcntrp_CPMM[,2:13], Rowv = TRUE, Colv=TRUE, method="complete", ColSideCut = 0.07,ColSideWidth=0.8,col=colorRampPalette(c("#2c7bb6", "#ffffbf", "#d7191c"))(1024),distfun = function(x) as.dist(1 - cor(t(x), method = "spearman", use = "pa")), balanceColor = TRUE)
+
+
+glutamate_CPMM <- subset.data.frame(cpmTotalP7P90, (cpmTotalP7P90$mgi_symbol %in% glutamate) , select=c("Row.names", "E13.5B1", "E13.5B2", "E13.5B3", "E13.5S1", "E13.5S2", "E13.5S3", "P7S1", "P7S2", "P7S3", "P7B1", "P7B2", "P7B3",  "mgi_symbol"))
+rownames(glutamate_CPMM) <- glutamate_CPMM$mgi_symbol
+heatmap3(glutamate_CPMM[,2:13], Rowv = TRUE, Colv=TRUE, method="complete", ColSideCut = 0.07,ColSideWidth=0.8,col=colorRampPalette(c("#2c7bb6", "#ffffbf", "#d7191c"))(1024),distfun = function(x) as.dist(1 - cor(t(x), method = "spearman", use = "pa")), balanceColor = TRUE)
+
+gaba_CPMM <- subset.data.frame(cpmTotalP7P90, (cpmTotalP7P90$mgi_symbol %in% gaba) , select=c("Row.names", "E13.5B1", "E13.5B2", "E13.5B3", "E13.5S1", "E13.5S2", "E13.5S3", "P7S1", "P7S2", "P7S3", "P7B1", "P7B2", "P7B3",  "mgi_symbol"))
+rownames(gaba_CPMM) <- gaba_CPMM$mgi_symbol
+heatmap3(gaba_CPMM[,2:13], Rowv = TRUE, Colv=TRUE, method="complete", ColSideCut = 0.07,ColSideWidth=0.8,col=colorRampPalette(c("#2c7bb6", "#ffffbf", "#d7191c"))(1024),distfun = function(x) as.dist(1 - cor(t(x), method = "spearman", use = "pa")), balanceColor = TRUE)
+
+heatmap3(gaba_CPMM[,2:13], Rowv = TRUE, Colv=TRUE, method="complete", ColSideCut = 0.07,ColSideWidth=0.8,col=colorRampPalette(c("#2c7bb6", "#ffffbf", "#d7191c"))(1024), balanceColor = TRUE)
+
+
+neuromodulators_CPMM <- subset.data.frame(cpmTotalP7P90, (cpmTotalP7P90$mgi_symbol %in% neuromodulators) , select=c("Row.names", "E13.5B1", "E13.5B2", "E13.5B3", "E13.5S1", "E13.5S2", "E13.5S3", "P7S1", "P7S2", "P7S3", "P7B1", "P7B2", "P7B3",  "mgi_symbol"))
+rownames(neuromodulators_CPMM) <- neuromodulators_CPMM$mgi_symbol
+heatmap3(neuromodulators_CPMM[,2:13], Rowv = TRUE, Colv=TRUE, method="complete", ColSideCut = 0.1,ColSideWidth=0.8,col=colorRampPalette(c("#2c7bb6", "#ffffbf", "#d7191c"))(1024),distfun = function(x) as.dist(1 - cor(t(x), method = "spearman", use = "pa")), balanceColor = TRUE)
+```
+
+
+
+
+
+
+
+```{r TDFB}
+setwd("/Users/darya/Documents/01_Postdoc/03_OPC/161122_TFdb")
+TFs <- read.table("TF", header = FALSE)
+names(TFdb) <- c("gene", "num_id", "mgi_symbol", "class")
+CRdb <- read.csv("tf", header = FALSE)
+ 
+```
+
+
+
+```{r ForIPA}
+genes4IPA <- c("Foxf1", "Lbx1", "Kat6a", "Kmt2a", "Emx1", "Emx2", "Otx1", "Otx2", "Dlx1", "Dlx2", "Lhx2", "Nkx2-1", "Eomes", "Commd3", "Phc2", "Rnf2", "Ezh2", "Sox2", "Shh", "Klf4", "Rxra", "Ascl1", "Myc", "Ctnnb1", "Wnt3a", "Wnt4", "Sox10", "Sox8", "Sirt2", "Nkx2-2", "Rbpjl", "Dbx2", "Kcnip3", "Npas1", "Myrf", "Tcf7l2", "Hnf1a", "Smad7", "Smarcb1", "Dlx2", "Dlx5", "Otx2", "Hes1", "Hes5", "Id3", "Sox11", "Myc", "Jun", "Sox4", "Notch1", "Bmp2", "Wnt8b", "Fgf2", "Sox10", "Olig1", "Olig2", "Nkx2-2", "Qk", "Sirt2", "Etv5", "Kpna2", "Kank1", "Ostf1", "Trp53", "Creb1", "Sirt1", "Crebbp", "Pparg", "Rela", "Ar", "Tgfa", "Bdnf", "Tgfb1", "Tnf", "Igf1", "Egf", "Wnt3a", "Pdgfb", "Ngf", "Cdkn2a", "Cdkn1a", "Foxm1", "Myc", "Ccna2", "Cdk1", "Cdc20", "Foxm1", "Pten", "Birc5", "Aurka", "Aurkb", "Kdm5a", "Smarcb1", "Egr1", "Klf4", "Jund", "Junb", "Fos", "App", "Tgfb1")
+
+genes4IPA_CPMM <- subset.data.frame(cpmTotalP7P90, (cpmTotalP7P90$mgi_symbol %in% genes4IPA) , select=c("Row.names", "E13.5B1", "E13.5B2", "E13.5B3", "E13.5S1", "E13.5S2", "E13.5S3", "P7S1", "P7S2", "P7S3", "P7B1", "P7B2", "P7B3",  "mgi_symbol"))
+rownames(genes4IPA_CPMM) <- genes4IPA_CPMM$mgi_symbol
+heatmap3(genes4IPA_CPMM[,2:13], Rowv = TRUE, Colv=TRUE, method="complete", ColSideCut = 0.07,ColSideWidth=0.8, col=colorRampPalette(c("#2c7bb6", "#ffffbf", "#d7191c"))(1024), balanceColor = TRUE)
+
+ 
+```

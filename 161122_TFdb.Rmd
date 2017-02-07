@@ -1,0 +1,48 @@
+---
+title: "TFfromIPA analysis"
+author: "Darya Vanichkina"
+date: "22/11/2016"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+setwd("/Users/darya/Documents/01_Postdoc/03_OPC/161122_TFdb/")
+TFdb <- read.csv("TFwGeneNames.csv", header = FALSE)
+names(TFdb) <- c("gene", "num_id", "mgi_symbol", "class")
+
+IPA_PvsE <- read.table("../161116_IPA/PvsEearlyTotalAnno4LogFC.txt", sep = "\t", header = TRUE)
+
+capwords <- function(s, strict = FALSE) {
+    cap <- function(s) paste(toupper(substring(s, 1, 1)),
+                  {s <- substring(s, 2); if(strict) tolower(s) else s},
+                             sep = "", collapse = " " )
+    sapply(strsplit(s, split = " "), cap, USE.NAMES = !is.null(names(s)))
+}
+IPA_PvsE$Regulator <- tolower(IPA_PvsE$Upstream.Regulator)
+IPA_PvsE$Regulator <- capwords(IPA_PvsE$Regulator)
+
+table(IPA_PvsE$Regulator %in% TFdb$mgi_symbol)
+
+
+
+IPA_PvsE.sig <- subset.data.frame(IPA_PvsE, (IPA_PvsE$p.value.of.overlap <= 0.01) & (IPA_PvsE$Regulator %in% TFdb$mgi_symbol))
+```
+
+
+
+```{r BvsS}
+
+IPA_BvsS <- read.table("../161116_IPA/BvsSearly.log4FC.txt", sep = "\t", header = TRUE)
+
+IPA_BvsS$Regulator <- tolower(IPA_BvsS$Upstream.Regulator)
+IPA_BvsS$Regulator <- capwords(IPA_BvsS$Regulator)
+
+table(IPA_BvsS$Regulator %in% TFdb$mgi_symbol)
+
+
+
+IPA_BvsS.sig <- subset.data.frame(IPA_BvsS, (IPA_BvsS$p.value.of.overlap <= 0.01) & (IPA_BvsS$Regulator %in% TFdb$mgi_symbol))
+
+write.csv(IPA_BvsS.sig$Upstream.Regulator, "IPA_BvsS.sig.txt", quote = FALSE, row.names = FALSE) 
+```
+
