@@ -1,0 +1,2437 @@
+---
+title: "Generating the figures"
+output: html_notebook
+---
+
+
+```{r, include=FALSE}
+
+
+
+
+load("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/SCDE_analysis_errormodelsE13P7lineagetracingmodel.RData")
+clpca <- readRDS("~/Documents/pagoda_app/PAGODAapp_lineage/clpca.rds")
+go.env <- readRDS("~/Documents/pagoda_app/PAGODAapp_lineage/go.env.rds")
+hc <- readRDS("~/Documents/pagoda_app/PAGODAapp_lineage/hc.rds")
+pwpca <- readRDS("~/Documents/pagoda_app/PAGODAapp_lineage/pwpca.rds")
+tam <- readRDS("~/Documents/pagoda_app/PAGODAapp_lineage/tam.rds")
+tamr2 <- readRDS("~/Documents/pagoda_app/PAGODAapp_lineage/tamr2.rds")
+varinfo <- readRDS("~/Documents/pagoda_app/PAGODAapp_lineage/varinfo.rds")
+df <- readRDS("~/Documents/pagoda_app/PAGODAapp_lineage/df.rds")
+knn <- readRDS("~/Documents/pagoda_app/PAGODAapp_lineage/knn.rds")
+library(scde)
+
+# filter out cells that don't show positive correlation with
+# the expected expression magnitudes (very poor fits)
+valid.cells <- o.ifm$corr.a > 0
+table(valid.cells)
+
+o.ifm <- o.ifm[valid.cells, ]
+
+# estimate gene expression prior
+o.prior <- scde.expression.prior(models = o.ifm, counts = cd, length.out = 400, show.plot = FALSE)
+
+cluster <- as.factor(rbind(groups = cutree(hc, 15)))
+names(cluster) <- colnames(cd)
+
+setwd("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7")
+file_names_expression=as.list(dir(path = "data/",pattern="*_expression_for_R.tab"))
+file_names_annotation=as.list(dir(path = "data/",pattern="*_MATLAB_annotations.tab"))
+
+
+library(GA)
+library(parallel)
+library(memoise)
+library(plyr)
+library(reshape2)
+library(clValid)
+library(cluster)
+library(dplyr)
+library(MASS)
+library(RColorBrewer)
+
+library(fastICA)
+library(tripack)
+library(kohonen)
+library(org.Mm.eg.db)
+
+
+#library(ForceAtlas2)
+#library(rgl)
+library(caret)
+library(heatmap3)
+library(monocle)
+
+library(dplyr)
+library(plyr)
+library(biomaRt)
+library(scde)
+library(igraph)
+library(ggplot2)
+
+setwd("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/data")
+expressions <- lapply(file_names_expression,read.table,header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+names(expressions) <- file_names_expression
+list2env(expressions,environment())
+row.names_expressions <- expressions[[1]][,1]
+rm(list = as.character(names(expressions)))
+expressions <- lapply(expressions,`[`,-1)
+names(expressions) <- file_names_expression
+expressions <- do.call(cbind,expressions)
+row.names(expressions) <- row.names_expressions
+
+annotations <- lapply(file_names_annotation,read.table,header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+names(annotations) <- file_names_annotation
+list2env(annotations,environment())
+row.names_annotations <- annotations[[1]][,1]
+rm(list = as.character(names(annotations)))
+annotations <- lapply(annotations,`[`,-1)
+names(annotations) <- file_names_annotation
+annotations <- do.call(cbind,annotations)
+row.names(annotations) <- row.names_annotations
+rm(list=ls(pattern="row.names_"))
+setwd("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7")
+
+idx <- !duplicated(t(annotations))
+annotations <- t(annotations)
+annotations <- as.data.frame(annotations[idx,]) # remove duplicated rows
+
+annotations$Sample <- as.factor(annotations[,'Plate'])
+annotations$Sample <- revalue(annotations$Sample, c("1771-048-203"="P7-Brain", "1771-048-224"="P7-Brain","1771-051-143"="P7-Spinal-Cord-old","1771-051-152"="E13.5-Brain", "1771-051-162"="E13.5-Brain",
+                                                    "1771-055-004"="E13.5-Brain","1771-055-005"="E13.5-Brain","1771-055-006"="E13.5-Brain","1771-055-007"="E13.5-Spinal-Cord",
+                                                    "1771-055-008"="P7-Spinal-Cord","1772-122-163"="E13.5-Brain","1772-122-164"="E13.5-Spinal-Cord","1772-122-165"="E13.5-Spinal-Cord","1772-122-239"="E13.5-Spinal-Cord",
+                                                    "1772-122-241"="P7-Spinal-Cord","1772-122-243"="P7-Spinal-Cord","1772-122-244"="P7-Spinal-Cord"))
+levels(annotations$Sample)
+emat <- expressions[,idx]
+rm(expressions,file_names_annotation,file_names_expression,idx)
+#write.table(emat,file = "E13.5_P7_expression.txt", sep="\t",row.names = TRUE, col.names = TRUE)
+#write.table(annotations,file = "E13.5_P7_annotation.txt", sep="\t",row.names = TRUE, col.names = TRUE)
+colnames(emat) <- rownames(annotations)
+emat[1:10,1:4] # Inspect the data...
+
+#Load OPC dataset
+expression_matrix <- read.csv("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/data/moldate_finaloligos_ALLgenes_onlyoligos_lev2_no_annot_26-Feb-2016.txt", header=TRUE,as.is=TRUE,check.names=FALSE,row.names=1)
+colnames(expression_matrix) <- gsub(" ", "", colnames(expression_matrix), fixed = TRUE)
+colnames(expression_matrix) <- gsub("\t", "", colnames(expression_matrix), fixed = TRUE)
+#expression_matrix <- as.matrix(expression_matrix)
+# get an idea of the data
+head(expression_matrix[1:4])
+
+# create the expression_matrix file also called assayData, by reading it in ,and transpose its contents making columnnames rownames (cells=columns,genes=rows), save cellnames, transpose, put cellnames as columnnames, this way expressionvalues keep formatted as numbers otherwise you get strings(text) which is unprocessable
+annotable <-  read.delim("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/data/annotable_for_moldate_finaloligos_validgenes_lev2_no_annot_26-Feb-2016.txt", header=FALSE, sep="\t", as.is=TRUE,check.names=FALSE)
+
+n <- annotable$V1
+annotable <- as.data.frame(t(annotable[,-1]))
+colnames(annotable) <- n
+#colnames(expression_matrix) <- annotable$cellid
+#row.names(annotable) <- annotable$cellid
+annotable <- as.matrix(annotable)
+write.table(annotable, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/data/annotable_for_moldate_finaloligos_validgenes_lev2_no_annot_04-Nov-2015_rewrite_input.txt", sep = "\t")
+annotable <-  read.delim("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/data/annotable_for_moldate_finaloligos_validgenes_lev2_no_annot_04-Nov-2015_rewrite_input.txt", header=TRUE, sep="\t", as.is=TRUE,check.names=FALSE)
+annotable[, 'age'] <- as.factor(annotable[,'age'])
+annotable[, 'sex'] <- as.factor(annotable[,'sex'])
+annotable[, 'tissue'] <- as.factor(annotable[,'tissue'])
+annotable[, 'chipid'] <- as.factor(annotable[,'chipid'])
+annotable[, 'cellid'] <- as.factor(annotable[,'cellid'])
+annotable[, 'diameter'] <- as.factor(annotable[,'diameter'])
+colnames(annotable)[8] <- "cell_class"
+annotable[, 'cell_class'] <- as.factor(annotable[,'cell_class'])
+#annotable <- unname(annotable, force = T)
+# see if the expression file is correctly split
+head(annotable[1:8])
+levels(annotable$cell_class)
+
+colnames(expression_matrix) <- annotable$cellid
+dim(annotable)
+annotable <- annotable[ !duplicated(annotable$cellid),]
+dim(annotable)
+row.names(annotable) <- annotable$cellid
+
+dim(expression_matrix)
+expression_matrix <- expression_matrix[, !duplicated(colnames(expression_matrix))]
+dim(expression_matrix)
+
+colnames(expression_matrix) == row.names(annotable)
+
+annotable_feb <-  read.delim("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/data/metadate_oligos_in_tsne_22-Feb-2016.txt", header=TRUE, sep="\t", as.is=TRUE,check.names=FALSE)
+annotable_feb <- annotable_feb[ !duplicated(annotable_feb$cellID),]
+row.names(annotable_feb) <- annotable_feb$cellID
+annotable_feb[, 'age'] <- as.factor(annotable_feb[,'age'])
+colnames(annotable_feb)[6] <- "sex"
+annotable_feb[, 'sex'] <- as.factor(annotable_feb[,'sex'])
+annotable_feb[, 'tissue'] <- as.factor(annotable_feb[,'tissue'])
+annotable_feb[, 'GFP'] <- as.factor(annotable_feb[,'GFP'])
+colnames(annotable_feb)[1] <- "cellid"
+annotable_feb[, 'cellid'] <- as.factor(annotable_feb[,'cellid'])
+annotable_feb[, 'diameter'] <- as.factor(annotable_feb[,'diameter'])
+colnames(annotable_feb)[2] <- "cell_class"
+annotable_feb[, 'cell_class'] <- as.factor(annotable_feb[,'cell_class'])
+annotable_feb[, 'strain'] <- as.factor(annotable_feb[,'strain'])
+annotable_feb[, 'diameter'] <- as.factor(annotable_feb[,'diameter'])
+
+expression_matrix <- as.matrix(expression_matrix[,row.names(annotable_feb)])
+
+annotations_renamed <- rename(annotations, c("Green"="GFP","Sample"="cell_class", "Red"="tissue", "Blue" = "Age","Plate"="Strain"))
+levels(annotations_renamed$tissue)
+annotable_feb$Valid <- "Y"
+annotable_feb$Strain <- annotable_feb$strain
+annotable_feb <- annotable_feb[,-3]
+annotations_renamed$cellid <- apply(annotations_renamed,1,function(x){paste(x[3],x[1],sep = "_")})
+annotations_renamed$Sex_original_amit <- "NA"
+annotable_feb <- rename(annotable_feb, c("diameter"="Diameter", "age"="Age", "sex"="Sex_original_amit"))
+annotations_renamed <- annotations_renamed[,-c(1,2,4,6)]
+annotable <- rbind(annotable_feb,annotations_renamed)
+
+expression_matrixNOVLMC <- as.data.frame(expression_matrix[,row.names(subset(annotable_feb,! cell_class %in% c("PPR")))])
+expression_matrixNOVLMC <- clean.counts(expression_matrixNOVLMC[-c(1:109),], min.lib.size=1, min.reads = 1, min.detected = 10)
+
+write(row.names(expression_matrixNOVLMC),"expression_Science_paper.txt")
+
+
+ERCC <- subset(emat, grepl("ERCC-*", row.names(emat)))
+emat_saved <- emat
+
+
+#Convert to gencode using biomart
+listMarts()
+ensembl = useMart("ensembl",dataset="mmusculus_gene_ensembl")
+listDatasets(ensembl)
+attributes = listAttributes(ensembl)
+Biomart_gencode_ensembl84_biotypes <- getBM(attributes=c("mgi_symbol","ensembl_gene_id","gene_biotype"), filters = "", values = "", ensembl)
+Biomart_gencode_ensembl84_biotypes[, 'gene_biotype'] <- as.factor(Biomart_gencode_ensembl84_biotypes[,'gene_biotype'])
+#Filter for only our genes
+Biotype_All_dataset <- subset(Biomart_gencode_ensembl84_biotypes, mgi_symbol %in% row.names(emat_saved))
+
+emat <- subset(emat_saved, !grepl("ERCC-*", row.names(emat)))
+Mitochondrial <- subset(Biotype_All_dataset$mgi_symbol, grepl("Mt_*", Biotype_All_dataset$gene_biotype))
+Mitochondrial <- emat[Mitochondrial,]
+ERCC_counts <- as.numeric(apply(ERCC, 2, sum))
+total_Spikein <- as.numeric(as.vector(annotations$SpikeMolecules))
+Mitochondrial_counts <- as.numeric(apply(Mitochondrial, 2, sum))
+total_counts <- as.numeric(apply(emat,2,sum))
+QC <- as.data.frame(cbind(ERCC_counts,total_Spikein,total_counts,Mitochondrial_counts))
+QC$CaptureEfficiency <- (QC$ERCC_counts / QC$total_Spikein)
+QC$PercOfReadMappedToSpikein <- (QC$ERCC_counts / QC$total_counts)
+QC[is.na(QC)] <- 0
+QC <- as.matrix(QC)
+QC[is.infinite(QC)] <- 0
+QC <- as.data.frame(QC)
+QC$NormalizedCounts <- round((QC$total_counts * QC$CaptureEfficiency),0)
+row.names(QC) <- row.names(annotations)
+
+emat <- emat[row.names(expression_matrix),]
+annotations_renamed <- annotations_renamed[colnames(emat),]
+#colnames(emat) <- annotations_renamed$cellid
+genes <- intersect(row.names(emat),row.names(expression_matrix))
+emat <- cbind(emat[genes,],expression_matrix[genes,])
+annotable <- annotable[colnames(emat),]
+
+#subset to E13.5-COPCs
+annotable$cell_class <- revalue(annotable$cell_class, c("PPR"="VLMC"))
+annotable$cell_class <- revalue(annotable$cell_class, c("P7-Spinal-Cord-old"="P7-Spinal-Cord"))
+table(annotable$cell_class)
+levels(annotable$cell_class)
+barplot(table(annotable$tissue,annotable$cell_class),col=c(seq_along(levels(annotable$tissue))))
+# "COP","MFOL1","MFOL2","MOL1","MOL2","MOL3","MOL4","MOL5","MOL6","NFOL1","NFOL2","OPC","PPR","P7-Brain","P7-Spinal-Cord-old","E13.5-Brain","E13.5-Spinal-Cord","P7-Spinal-Cord"
+#clean datasetII
+emat <- emat[,row.names(subset(annotable, cell_class %in% c("VLMC","P7-Brain","P7-Spinal-Cord-old","E13.5-Brain","E13.5-Spinal-Cord","P7-Spinal-Cord","OPC","COP",
+                                                            "1771-055-045","1772-146-142","1772-158-147","1772-158-148","1772-158-149","1772-158-157","1772-158-162","1772-158-164","1772-158-165")))]
+levels(annotable$Age)
+#"16"  "18"  "19"  "20"  "21"  "22"  "23"  "24"  "25"  "26"  "27"  "28"  "29"  "31"  "50"  "60"  "61"  "62" "63"  "67"  "68"  "69"  "90"  "NaN" "0"
+new_Age <- c("Juvenile","Juvenile","Juvenile","Juvenile","Juvenile","Juvenile","Juvenile","Juvenile","Juvenile","Juvenile","Juvenile","Juvenile","Juvenile","Juvenile","Adult","Adult","Adult","Adult","Adult","Adult","Adult","Adult","Adult","Juvenile","E13.5-P7")
+annotable$Age <- factor(new_Age[annotable$Age])
+annotable <- annotable[colnames(emat),]
+
+emat_all <- emat
+
+backSPINmarkertable<- read.delim("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/markertable_oligoDavid_backspinv2_lev7_08-Dec-2016_annotated_by_David.txt", header=TRUE, sep="\t", as.is=TRUE,check.names=FALSE)
+row.names(backSPINmarkertable) <- backSPINmarkertable[,1]
+backSPINmarkertable <- backSPINmarkertable[,-c(1,4)]
+backSPINmarkertable <- backSPINmarkertable[row.names(annotable_backSPIN),]
+MainBackSPIN <- backSPINmarkertable$MainClusters
+SubBackSPIN <- backSPINmarkertable$bSPIN
+backSPINmarkertable <- backSPINmarkertable[,-c(1,3)]
+backSPINmarkertableHM <- log(backSPINmarkertable[,c(-1,-2,-3)]+1)
+
+backspinmarkertable_reversed <- backSPINmarkertable[,-c(1,2)]
+colnames(backspinmarkertable_reversed) <- rev(colnames(backspinmarkertable_reversed))
+
+emat_backSPIN <- emat_all
+cellid <-as.character(annotable$cellid)
+cellid <- gsub("-", "", cellid, fixed = TRUE)
+colnames(emat_backSPIN) <-cellid
+emat_backSPIN <- emat_backSPIN[,row.names(backSPINmarkertable)]
+annotable_backSPIN <- annotable
+row.names(annotable_backSPIN) <- cellid
+annotable_backSPIN <- annotable_backSPIN[row.names(backSPINmarkertable),]
+annotable_backSPIN$AnnotationBSPIN <- backSPINmarkertable$AnnotationBSPIN
+
+backSPINold <-  read.delim("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/data/backSPIN_E13P7_2016.txt",header=FALSE, sep="\t",as.is=TRUE,check.names=FALSE)[-1,]
+
+annotable_backSPINold <- annotable_backSPIN[backSPINold$V1,]
+emat_backSPINold <- emat_backSPIN[,backSPINold$V1]
+emat_backSPINnew <- as.data.frame(t(subset(as.data.frame(t(emat_backSPIN)),! colnames(emat_backSPIN) %in% backSPINold$V1)))
+annotable_backSPINold <- annotable_backSPIN[backSPINold$V1,] 
+
+annotable_backSPINold <- annotable_backSPINold[,] 
+
+annotable_backSPINnew <- annotable_backSPIN[colnames(emat_backSPINnew),] 
+annotable_backSPINold$OrigBackSPIN <- backSPINold$V3
+annotable_backSPINnew$OrigBackSPIN <- annotable_backSPINnew$cell_class
+emat_backSPIN <- cbind(emat_backSPINnew,emat_backSPINold)
+annotable_backSPIN <- rbind(annotable_backSPINnew,annotable_backSPINold)
+annotable_backSPINcleaned <- subset(annotable_backSPIN,! OrigBackSPIN %in% "")#,"some_neuronal","endo_MF"))
+emat_backSPINcleaned <- emat_backSPIN[,row.names(annotable_backSPINcleaned)]
+table(annotable_backSPINcleaned$OrigBackSPIN)
+#"1771-055-045","1772-146-142","1772-158-147","1772-158-148","1772-158-149","1772-158-157","1772-158-162","1772-158-164","1772-158-165"
+annotable_backSPINcleaned$OrigBackSPIN <- revalue(annotable_backSPINcleaned$OrigBackSPIN, c("1771-055-045"="E13.5 Lineage trace","1772-146-142"="E13.5 Lineage trace","1772-158-147"="E13.5 Lineage trace","1772-158-148"="E13.5 Lineage trace","1772-158-149"="E13.5 Lineage trace","1772-158-157"="E13.5 Lineage trace","1772-158-162"="P3 Lineage trace","1772-158-164"="P3 Lineage trace","1772-158-165"="P3 Lineage trace"))
+
+annotable_backSPINOPCs<- subset(annotable_backSPINcleaned, OrigBackSPIN %in% c("OPC","weak_OPC","E13.5 Lineage trace","P3 Lineage trace"))
+emat_OPCs <- emat_backSPIN[,row.names(annotable_backSPINOPCs)]
+
+annotable_backSPIN$OrigBackSPIN <- revalue(annotable_backSPIN$OrigBackSPIN, c("1771-055-045"="E13.5 Lineage trace","1772-146-142"="E13.5 Lineage trace","1772-158-147"="E13.5 Lineage trace","1772-158-148"="E13.5 Lineage trace","1772-158-149"="E13.5 Lineage trace","1772-158-157"="E13.5 Lineage trace","1772-158-162"="P3 Lineage trace","1772-158-164"="P3 Lineage trace","1772-158-165"="P3 Lineage trace"))
+
+FinalClusters <- MainBackSPIN
+#pnOPC <- cluster %in% c("1")
+#jaOPC <- cluster %in% c("4")
+#prolifOPC <- cluster %in% c("5")
+bsOPC <- FinalClusters %in% c("OPC","OPC3")
+FinalClusters[bsOPC] <- as.character(cluster[bsOPC])
+#FinalClusters[pnOPC] <- as.character(cluster[pnOPC])
+#FinalClusters[jaOPC] <- as.character(cluster[jaOPC])
+#FinalClusters[prolifOPC] <- as.character(cluster[prolifOPC])
+table(FinalClusters)
+names(FinalClusters) <- row.names(annotable_backSPIN)
+FinalClusters <- revalue(FinalClusters, c("1"="OPC1",
+                                          "4"="OPC2",
+                                          "5"="OPC3",
+                                          "10"="OPC2",
+                                          "12"="NFOLN",
+                                          "13"="MFOL2",
+                                          "14"="NP3",
+                                          "15"="NP2",
+                                          "2"="COP",
+                                          "3"="pnVLMC",
+                                          "6"="NP1a",
+                                          "7"="PLC",
+                                          "8"="NFOL",
+                                          "9"="eVLMC",
+                                           "COP"="COP",
+                                           "Cycling"="Cycling",
+                                           "MF"="NFOL",
+                                           "MF2"="MFOL2",
+                                           "NFOL1"="NFOL",
+                                           "NFOL2"="NFOL",
+                                           "NFOLN"="NFOLN",
+                                           "NP1" = "NP1b",
+                                           "NP2" = "NP1a",
+                                           "NP3"="NP2",
+                                           "NP4"="NP3",
+                                           "OPC"="OPC1",
+                                           "OPC3"="OPC3",
+                                           "Pericytelike"="PLC",
+                                           "VLMC1"="pnVLMC",
+                                           "VLMC2"="VLMC",
+                                           "VLMC_like"="eVLMC"))
+levels(as.factor(FinalClusters))
+saveRDS(FinalClusters,"FinalClusters.rds")
+```
+```{r}
+#annotable_backSPIN <- annotable_backSPINsaved
+#emat_backSPIN <- emat_backSPINsaved
+#emat_backSPINsaved <- emat_backSPIN
+#annotable_backSPINsaved <- annotable_backSPIN
+emat_backSPIN <- emat_backSPIN[,names(subset(FinalClusters,! FinalClusters %in% c("NFOLN","MFOL2","Unknown")))]
+annotable_backSPIN <- annotable_backSPIN[colnames(emat_backSPIN),]
+FinalClusters <- FinalClusters[row.names(annotable_backSPIN)]
+annotable_backSPIN <- annotable_backSPIN[,-c(10,11)]
+annotable_backSPIN$FinalClusters <- FinalClusters
+cellid <-as.character(annotable$cellid)
+cellid <- gsub("-", "", cellid, fixed = TRUE)
+row.names(annotable) <- cellid
+annotable_filtered <- subset(annotable, ! row.names(annotable) %in% row.names(annotable_backSPIN))
+annotable_filtered$FinalClusters <- "LowQuality"
+colnames(emat_all) <- cellid
+emat_filtered <- emat_all[,row.names(annotable_filtered)]
+annotable_complete <- rbind(annotable_filtered,annotable_backSPIN)
+emat_complete <- cbind(emat_filtered,emat_backSPIN)
+saveRDS(annotable_complete,"annotable_backSPIN.rds")
+saveRDS(emat_complete,"emat_backSPIN.rds")
+
+annotable_backSPIN$cell_class <- revalue(annotable_backSPIN$cell_class, c("1771-055-045"="E13.5 Lineage trace","1772-146-142"="E13.5 Lineage trace","1772-158-147"="E13.5 Lineage trace","1772-158-148"="E13.5 Lineage trace","1772-158-149"="E13.5 Lineage trace","1772-158-157"="E13.5 Lineage trace","1772-158-162"="P3 Lineage trace","1772-158-164"="P3 Lineage trace","1772-158-165"="P3 Lineage trace"))
+```
+```{r}
+AgeFactor <- character()
+BrainVSSpnCrd <- character()
+LineageTrace <- character()
+for(i in 1:nrow(annotable_backSPIN)) 
+{
+ x <- as.character(annotable_backSPIN$cell_class[i])
+ y <- as.character(annotable_backSPIN$Age[i])
+ z <- as.character(annotable_backSPIN$tissue[i])
+ LineageTrace[i] <- "None"
+  if(grepl("E13.5-",x)){AgeFactor[i] <- "E13.5"}
+ if(grepl("P7-",x)){AgeFactor[i] <- "P7"}
+ if(grepl("E13.5 ",x)){AgeFactor[i] <- "P7"}
+  if(grepl("P3 ",x)){AgeFactor[i] <- "P7"}
+ if(grepl("Juvenile",y)){AgeFactor[i] <- "Juvenile Adult"}
+ if(grepl("Adult",y)){AgeFactor[i] <- "Juvenile Adult"}
+ BrainVSSpnCrd[i] <- "Brain"
+ if(grepl("Spinal",x)){BrainVSSpnCrd[i] <- "SpinalCord"}
+ if(grepl("Brain",x)){BrainVSSpnCrd[i] <- "Brain"}
+ if(grepl("dorsal horn",z)){BrainVSSpnCrd[i] <- "SpinalCord"}
+ if(grepl("E13.5 ",x)){LineageTrace[i] <- "E13.5"}
+  if(grepl("P3 ",x)){LineageTrace[i] <- "P3"}
+}
+annotable_backSPIN$AgeFactor <- AgeFactor
+annotable_backSPIN$BrainVSSpnCrd <- BrainVSSpnCrd
+annotable_backSPIN$LineageTrace <- LineageTrace
+#generate Spinal cord only
+ematSpCrd <- emat_backSPIN[,row.names(annotable_backSPIN)][,grepl("Spinal-Cord*", annotable_backSPIN$cell_class)]
+ematSpCrd2 <- emat_backSPIN[,row.names(annotable_backSPIN)][,grepl("dorsal horn", annotable_backSPIN$tissue)]
+ematSpCrd <- cbind(ematSpCrd,ematSpCrd2)
+annotable_backSPINSpCrd <- annotable_backSPIN[colnames(ematSpCrd),]
+rm(ematSpCrd2)
+#generate Brain only
+ematBrain <- emat_backSPIN[,row.names(annotable_backSPIN)][,grepl("Brain*", annotable_backSPIN$cell_class)]
+ematBrain2 <- emat_backSPIN[,row.names(annotable_backSPIN)][,grepl("cortex S1", annotable_backSPIN$tissue)]
+ematBrain <- cbind(ematBrain,ematBrain2)
+annotable_backSPINBrain <- annotable_backSPIN[colnames(ematBrain),]
+rm(ematBrain2)
+#generate E13.5 only
+ematE13 <- emat_backSPIN[,row.names(annotable_backSPIN)][,grepl("E13.5-*", annotable_backSPIN$cell_class)]
+annotable_backSPINE13 <- annotable_backSPIN[colnames(ematE13),]
+#generate P7 only
+ematP7<- emat_backSPIN[,row.names(annotable_backSPIN)][,grepl("P7*", annotable_backSPIN$cell_class)]
+annotable_backSPINP7 <- annotable_backSPIN[colnames(ematP7),]
+#generate E13P7 together
+ematE13P7 <- cbind(ematE13,ematP7)
+annotable_backSPINE13P7 <- annotable_backSPIN[colnames(ematE13P7),]
+#generate OPCs
+ematOPCs <- emat_backSPIN[,row.names(annotable_backSPIN)][,grepl(c("\\bOPC*"), annotable_backSPIN$FinalClusters)]
+#ematOPCs2 <- emat_clean[,row.names(annotable_backSPINcleaned)][,grepl("weak_OPC", annotable_backSPINcleaned$backSPINall)]
+#ematOPCs3 <- emat_clean[,row.names(annotable_backSPINcleaned)][,grepl("neuroblast_Ebf3", annotable_backSPINcleaned$backSPINall)]
+#ematOPCs4 <- emat_clean[,row.names(annotable_backSPINcleaned)][,grepl("neuroblast_MotorLike", annotable_backSPINcleaned$backSPINall)]
+#ematOPCs5 <- emat_clean[,row.names(annotable_backSPINcleaned)][,grepl("neuroblast_sst", annotable_backSPINcleaned$backSPINall)]
+#ematOPCs6 <- emat_clean[,row.names(annotable_backSPINcleaned)][,grepl("neuronal_progenitors", annotable_backSPINcleaned$backSPINall)]
+#ematOPCs7 <- emat_clean[,row.names(annotable_backSPINcleaned)][,grepl("radial_glia", annotable_backSPINcleaned$backSPINall)]
+#ematOPCs8 <- emat_clean[,row.names(annotable_backSPINcleaned)][,grepl("internurons", annotable_backSPINcleaned$backSPINall)]
+#ematOPCs9 <- emat_clean[,row.names(annotable_backSPINcleaned)][,grepl("interneurons_weak", annotable_backSPINcleaned$backSPINall)]
+#ematOPCs <- cbind(ematOPCs,ematOPCs2,ematOPCs3,ematOPCs4,ematOPCs5,ematOPCs6,ematOPCs7,ematOPCs8,ematOPCs9)
+#rm(ematOPCs2,ematOPCs3,ematOPCs4,ematOPCs5,ematOPCs6,ematOPCs7,ematOPCs8,ematOPCs9)
+annotable_OPCs <- annotable_backSPIN[colnames(ematOPCs),]
+#generate P7 only
+LinTrace<- emat_backSPIN[,row.names(annotable_backSPIN)][,grepl("E13.5 Lineage*", annotable_backSPIN$cell_class)]
+LinTrace2 <- emat_backSPIN[,row.names(annotable_backSPIN)][,grepl("P3 Lineage*", annotable_backSPIN$cell_class)]
+LinTrace <- cbind(LinTrace,LinTrace2)
+rm(LinTrace2)
+annotable_LinTrace <- annotable_backSPIN[colnames(LinTrace),]
+
+#LintraceonlyOPCs
+LinTraceOPCs<- LinTrace[,row.names(annotable_LinTrace)][,grepl("\\bOPC*", annotable_LinTrace$FinalClusters)]
+annotable_LinTraceOPCs <- annotable_backSPIN[colnames(LinTraceOPCs),]
+
+#generate Spinal cord only without VLMC
+ematSpCrdnoVLMC <- emat_backSPIN[,row.names(annotable_backSPINSpCrd)][,! grepl("*VLMC", annotable_backSPINSpCrd$FinalClusters)]
+annotable_backSPINSpCrdnoVLMC <- annotable_backSPINSpCrd[colnames(ematSpCrdnoVLMC),]
+
+#generate Brain only without VLMC
+ematBrainnoVLMC <- emat_backSPIN[,row.names(annotable_backSPINBrain)][,! grepl("*VLMC", annotable_backSPINBrain$FinalClusters)]
+annotable_backSPINBrainnoVLMC <- annotable_backSPINBrain[colnames(ematBrainnoVLMC),]
+
+#generateVLMCs and Pericytes only
+ematVLMCs <- emat_backSPIN[,row.names(annotable_backSPIN)][, grepl("*VLMC", annotable_backSPIN$FinalClusters)]
+ematPericytes <- emat_backSPIN[,row.names(annotable_backSPIN)][, grepl("*PLC", annotable_backSPIN$FinalClusters)]
+ematVLMCs <- cbind(ematVLMCs,ematPericytes)
+rm(ematPericytes)
+annotable_backSPINVLMCs <- annotable_backSPIN[colnames(ematVLMCs),]
+
+#generateNPsonly
+ematNPs <- emat_backSPIN[,row.names(annotable_backSPIN)][, grepl("*NP", annotable_backSPIN$FinalClusters)]
+annotable_backSPINNPs <- annotable_backSPIN[colnames(ematNPs),]
+
+#Get genes from the dendogram differential expression, enrichment, and marker file
+setwd("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/")
+file_names_Dendo=as.list(dir(path = "MarkersSCDE/DendoComparisons/",pattern="*.txt"))
+file_names_Enriched=as.list(dir(path = "MarkersSCDE/EnrichedGenesPerPopulation/",pattern="*.txt"))
+file_names_Markers=as.list(dir(path = "SCDEmarkers_FinalClusters/",pattern="*.txt"))
+
+setwd("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/DendoComparisons/")
+expressions <- lapply(file_names_Dendo,read.table,header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+names(expressions) <- file_names_Dendo
+DendoGenestop100 <-lapply(expressions,row.names)
+DendoGenestop100 <- sapply(DendoGenestop100,'[',1:10 ) 
+DendoGenestop100 <- unique(c(DendoGenestop100))
+setwd("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/EnrichedGenesPerPopulation/")
+expressions <- lapply(file_names_Enriched,read.table,header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+names(expressions) <- file_names_Enriched
+EnrichedGenestop100 <-lapply(expressions,row.names)
+EnrichedGenestop100 <- sapply(EnrichedGenestop100,'[',1:10 ) 
+EnrichedGenestop100 <- unique(c(EnrichedGenestop100))
+setwd("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/SCDEmarkers_FinalClusters/")
+expressions <- lapply(file_names_Markers,read.table,header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+names(expressions) <- file_names_Markers
+MarkersGenestop100 <-lapply(expressions,row.names)
+MarkersGenestop100 <- sapply(MarkersGenestop100,'[',1:5 ) 
+MarkersGenestop100 <- unique(c(MarkersGenestop100))
+MarkersGenestop100 <- MarkersGenestop100[!is.na(MarkersGenestop100)]
+AllGenesFromAnalysis <- union(union(DendoGenestop100,EnrichedGenestop100),MarkersGenestop100)
+
+TFlist <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/TFlist.txt")
+TFlist <- TFlist$V1
+ChMlist <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/ChMlist.txt")
+ChMlist <- ChMlist$V1
+CoFactorslist <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/CoFactorslist.txt")
+CoFactorslist <- CoFactorslist$V1
+AllTfsList <- union(union(TFlist,ChMlist),CoFactorslist)
+
+```
+```{r}
+length(intersect(row.names(annotable_backSPIN),colnames(emat_ncRNA)))
+emat_ncRNA_filtered <- emat_ncRNA[,row.names(annotable_backSPIN) %in% colnames(emat_ncRNA)]
+idx <- !duplicated(t(emat_ncRNA))
+emat_ncRNA_filtered <- emat_ncRNA[,idx]
+annotable_ncRNA <- subset(annotable_backSPIN,row.names(annotable_backSPIN) %in% colnames(emat_ncRNA_filtered))
+emat_ncRNA_filtered <- emat_ncRNA_filtered[,row.names(annotable_ncRNA)]
+emat_backSPIN <- emat_ncRNA_filtered
+annotable_backSPIN <- annotable_ncRNA
+```
+```{r}
+CVsq <- function(x) {(sd(x)/mean(x))^2}
+emat_expressed <- apply(emat_backSPIN,1,function(x) any ((x) >= 1))
+emat_expressed <- emat_backSPIN[emat_expressed,]
+#emat_expressed <- apply(emat_backSPIN,1,function(x) var(x) > 0)
+#emat_expressed <- emat[emat_expressed,]
+CV2 <- apply(emat_expressed,1,CVsq)
+meancounts <- apply(emat_expressed,1,mean)
+CV2_matrix <- matrix(c(log(meancounts),log(CV2)),nrow = length(CV2),ncol = 2)
+row.names(CV2_matrix) <- names(CV2)
+colnames(CV2_matrix) <- c("LogExpr","CV2")
+CV2_matrix <- as.data.frame(CV2_matrix)
+#plot(CV2_matrix,xlab ="Mean Count Magnitude (log)",ylab="Squared Coefficient of Variation", pch=20, cex=0.3)
+library(e1071)
+model <- svm(CV2 ~ LogExpr ,CV2_matrix, gamma = 0.06)
+predictedY <- predict(model, CV2_matrix)
+#plot(CV2_matrix,xlab ="Mean Count Magnitude (log)",ylab="Squared Coefficient of Variation", pch=20, cex=0.3)
+#points(CV2_matrix$LogExpr,predictedY, col="red",pch=20, cex=0.1)
+CV2_matrix <- cbind(CV2_matrix,predictedY)
+CV2_matrix$RelativeVariance <-CV2_matrix$CV2 - CV2_matrix$predictedY
+NormGenes <- row.names(subset(CV2_matrix, RelativeVariance > 0.0))
+NormGenesFactor <- as.factor(1*(CV2_matrix$RelativeVariance > 0.0))
+plot(CV2_matrix$LogExpr,CV2_matrix$CV2,xlab ="Mean Count Magnitude (log)",ylab="Squared Coefficient of Variation", pch=20, cex=0.3, col=NormGenesFactor)
+points(CV2_matrix$LogExpr,predictedY, col="green",pch=20, cex=0.1)
+length(NormGenes)
+```
+
+```{r, message=FALSE, warning=FALSE, include=FALSE}
+pca <- prcomp(t(log(emat_backSPIN[AllGenesFromAnalysis,]+1)),scale. = FALSE)
+tsne <- t(pca$x[,c(1:30)])
+library(Rtsne)
+set.seed(123456789)
+tsne_out <- Rtsne(t(tsne), initial_dims=20, perplexity=60,max_iter = 1000,check_duplicates = FALSE,
+                  verbose = TRUE, theta = 0.0, pca = FALSE)
+rownames(tsne_out$Y) <- colnames(tsne)
+#save tSNE coordinates
+saveRDS(tsne_out$Y,"tSNEcoordinates.rds")
+```
+Figure 4 generation
+```{r}
+
+TissuesOrdered <- revalue(as.factor(annotable_backSPIN$cell_class), c("OPC"="Juvenile Adult",
+                                                                             "COP"="Juvenile Adult",
+                                                                             "VLMC"="Juvenile Adult",
+                                                                             "P7-Brain"="P7-Brain",
+                                                                             "P7-Spinal-Cord"="P7-Spinal-Cord",
+                                                                             "E13.5-Brain"="E13.5-Brain",
+                                                                             "E13.5-Spinal-Cord"="E13.5-Spinal-Cord",
+                                                                             "E13.5 Lineage trace"="P7-Brain",
+                                                                             "P3 Lineage trace"="P7-Brain"))
+TissuesOrdered <- factor(TissuesOrdered, levels=c("E13.5-Brain","E13.5-Spinal-Cord","P7-Brain","P7-Spinal-Cord","Juvenile Adult"))
+
+palette <- c("#a6cee3","#1f78b4","#b2df8a","#33a02c","#e31a1c","#999999","#a65628","#fa9fb5","#dbdb00")
+ggplot(as.data.frame(tsne_out$Y), aes(x=V1, y=V2, colour=TissuesOrdered)) +
+  geom_point(size=5) + geom_density2d(alpha=0.0,size=0.5, color="black", bins=10)  + (scale_colour_manual(TissuesOrdered,values=palette)) +
+  theme(strip.background = element_blank(), strip.text.x = element_blank(),axis.text.x = element_blank(),axis.text.y= element_blank(),axis.ticks= element_blank(),axis.line  = element_blank(),panel.border = element_blank(),legend.position  = "right") + xlab("tSNE_1") + ylab("tSNE_2") + 
+  theme_bw() +
+  theme(axis.line = element_line(colour = "black"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       panel.border = element_blank(),
+       panel.background = element_blank())
+ggsave("~/Documents/Projects/Papers/E13.5-P7/Figures/Figure4/4a.pdf", width = 18, height = 12)
+FinalClustersOrdered <- factor(annotable_backSPIN$FinalClusters, levels=c("OPC1","OPC2","OPC3","COP","NFOL","Cycling","NP1a","NP1b","NP2","NP3","eVLMC","PLC","pnVLMC","VLMC"))
+palette <- c("#c6dbef","#6baed6","#08519c","#006d2c","#41ab5d","#000000","#cab2d6","#6a3d9a","#dadaeb","#c994c7","#fcbba1","#ef3b2c","#a63603","#f16913")
+ggplot(as.data.frame(tsne_out$Y), aes(x=V1, y=V2, colour=FinalClustersOrdered)) +
+  geom_point(size=1) + geom_density2d(alpha=0.0,size=0.1, color="black", bins=10)  + (scale_colour_manual(FinalClustersOrdered,values=palette)) +
+  theme(strip.background = element_blank(), strip.text.x = element_blank(),axis.text.x = element_blank(),axis.text.y= element_blank(),axis.ticks= element_blank(),axis.line  = element_blank(),panel.border = element_blank(),legend.position  = "right") + 
+  xlab("tSNE_1") + ylab("tSNE_2")  +
+  theme_bw() +
+  theme(axis.line = element_line(colour = "black"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       panel.border = element_blank(),
+       panel.background = element_blank())
+LinTraceordered <- revalue(as.factor(annotable_backSPIN$cell_class), c("OPC"="Other",
+                                                                       "COP"="Other",
+                                                                       "VLMC"="Other",
+                                                                       "P7-Brain"="Other",
+                                                                       "P7-Spinal-Cord"="Other",
+                                                                       "E13.5-Brain"="Other",
+                                                                       "E13.5-Spinal-Cord"="Other",
+                                                                       "E13.5 Lineage trace"="E13.5 Lineage trace",
+                                                                       "P3 Lineage trace"="P3 Lineage trace"))
+#LinTraceordered <- factor(LinTraceordered, levels=c("E13.5 Lineage trace","P3 Lineage trace","Other"))
+palette <- c("#d3d3d3","#e41a1c","#377eb8")
+ggplot(as.data.frame(tsne_out$Y), aes(x=V1, y=V2, colour=LinTraceordered)) +
+  geom_point(size=5) + geom_density2d(alpha=0.0,size=0.5, color="black", bins=10)  + (scale_colour_manual(LinTraceordered,values=palette)) +
+  theme(strip.background = element_blank(), strip.text.x = element_blank(),axis.text.x = element_blank(),axis.text.y= element_blank(),axis.ticks= element_blank(),axis.line  = element_blank(),panel.border = element_blank(),legend.position  = "right") + 
+  xlab("tSNE_1") + ylab("tSNE_2") + 
+  theme_bw() +
+  theme(axis.line = element_line(colour = "black"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       panel.border = element_blank(),
+       panel.background = element_blank())
+```
+```{r}
+library(scales)
+annotable_OPCs$AgeandTissue <- paste(annotable_OPCs$AgeFactor,annotable_OPCs$BrainVSSpnCrd,sep=" ")
+OPCsPerAge <- as.data.frame(table(annotable_OPCs$AgeandTissue,annotable_OPCs$FinalClusters))
+table(annotable_OPCs$AgeandTissue,annotable_OPCs$FinalClusters)
+palette <- c("#c6dbef","#6baed6","#08519c")
+OPCsPerAgeOrdered <- factor(OPCsPerAge$Var1, levels=c("E13.5 Brain","P7 Brain","P7 SpinalCord","Juvenile Adult Brain","Juvenile Adult SpinalCord"))
+ggplot(data=OPCsPerAge, aes(x=OPCsPerAgeOrdered,y=Freq,fill = factor(Var2))) + (scale_fill_manual(as.factor(OPCsPerAge$Var2),values=palette))+ 
+  geom_bar(position = "fill",stat="identity")+ xlab("") + 
+    scale_y_continuous(labels = percent_format())+ ylab("Fraction of Cells") + theme_bw()+theme(axis.text.x = element_text(angle = 45, hjust = 1), panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       panel.border = element_blank(),
+       panel.background = element_blank())
+
+OPCsPerAge <- as.data.frame(table(annotable_OPCs$AgeFactor,annotable_OPCs$FinalClusters))
+OPCsPerAgeOrdered <- factor(OPCsPerAge$Var1, levels=c("E13.5","P7","Juvenile Adult"))
+ggplot(data=OPCsPerAge, aes(x=OPCsPerAgeOrdered,y=Freq,fill = factor(Var2))) + 
+  geom_bar(position = "fill",stat="identity")+ xlab("") + ylab("Fraction of Cells") + (scale_fill_manual(as.factor(OPCsPerAge$Var2),values=palette))+theme_bw()+theme(axis.text.x = element_text(angle = 45, hjust = 1), panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       panel.border = element_blank(),
+       panel.background = element_blank())
+OPCsPerAge <- as.data.frame(table(annotable_OPCs$BrainVSSpnCrd,annotable_OPCs$FinalClusters))
+ggplot(data=OPCsPerAge, aes(x=Var1,y=Freq,fill = factor(Var2))) + 
+    scale_y_continuous(labels = percent_format())+ 
+  geom_bar(position = "fill",stat="identity")+ xlab("") + ylab("Fraction of Cells") + (scale_fill_manual(as.factor(OPCsPerAge$Var2),values=palette))+theme_bw()+theme(axis.text.x = element_text(angle = 45, hjust = 1), panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       panel.border = element_blank(),
+       panel.background = element_blank())
+
+lineageOPCs <- LinTrace[,row.names(subset(annotable_LinTrace, annotable_LinTrace$FinalClusters %in% c("OPC1","OPC2","OPC3")))]
+annotable_LinTraceOPCs <- annotable_LinTrace[colnames(lineageOPCs),]
+OPCsPerLineage <- as.data.frame(table(annotable_LinTraceOPCs$LineageTrace,annotable_LinTraceOPCs$FinalClusters))
+ggplot(data=OPCsPerLineage, aes(x=Var1,y=Freq,fill = factor(Var2)))+ 
+    scale_y_continuous(labels = percent_format()) + 
+  geom_bar(position = "fill",stat="identity")+ xlab("") + ylab("Fraction of Cells") + (scale_fill_manual(as.factor(OPCsPerAge$Var2),values=palette))+theme_bw()+theme(axis.text.x = element_text(angle = 45, hjust = 1), panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       panel.border = element_blank(),
+       panel.background = element_blank())
+
+names(MainBackSPIN) <- row.names(backSPINmarkertable)
+BackSPINmainClusters <- as.factor(subset(MainBackSPIN,names(MainBackSPIN)%in% row.names(annotable_backSPIN)))
+BackSPINmainClusters <- as.factor(as.numeric(BackSPINmainClusters))
+saveRDS(BackSPINmainClusters,"backSPIN.rds")
+PAGODAcluster <- as.factor(subset(cluster,names(cluster)%in% row.names(annotable_backSPIN)))
+saveRDS(PAGODAcluster,"PAGODA.rds")
+ggplot(as.data.frame(tsne_out$Y), aes(x=V1, y=V2, colour=BackSPINmainClusters)) +
+  geom_point(size=5) + geom_density2d(alpha=0.0,size=0.1, color="black", bins=10)  +
+  theme(strip.background = element_blank(), strip.text.x = element_blank(),axis.text.x = element_blank(),axis.text.y= element_blank(),axis.ticks= element_blank(),axis.line  = element_blank(),panel.border = element_blank(),legend.position  = "right") + 
+  xlab("tSNE_1") + ylab("tSNE_2")  +
+  theme_bw() +
+  theme(axis.line = element_line(colour = "black"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       panel.border = element_blank(),
+       panel.background = element_blank())
+
+ggplot(as.data.frame(tsne_out$Y), aes(x=V1, y=V2, colour=PAGODAcluster)) +
+  geom_point(size=5) + geom_density2d(alpha=0.0,size=0.1, color="black", bins=10)  +
+  theme(strip.background = element_blank(), strip.text.x = element_blank(),axis.text.x = element_blank(),axis.text.y= element_blank(),axis.ticks= element_blank(),axis.line  = element_blank(),panel.border = element_blank(),legend.position  = "right") + 
+  xlab("tSNE_1") + ylab("tSNE_2")  +
+  theme_bw() +
+  theme(axis.line = element_line(colour = "black"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       panel.border = element_blank(),
+       panel.background = element_blank())
+
+```
+Figure 5 generation
+```{r, fig.width=5}
+
+#Add Midbrain
+# open the expression file to start formatting the expression data for monocle, with header and indicating that the data is tab delimited. The check.names expression prevents any alteration of the data (so if anything goes wrong we know that it is because of the original data file)
+midbrain_expr <- read.table("/Users/david/Documents/SingleCellData/GitCloneWABI/E13.5-P7/DevMidBrain/Mouse_Embryo_fulldataset_expr.txt", header=TRUE,as.is=TRUE,check.names=FALSE,row.names=NULL,sep = "\t")
+midbrain_expr <- midbrain_expr[!duplicated(midbrain_expr[,1]),]
+row.names(midbrain_expr) <- midbrain_expr[,1]
+midbrain_expr <- midbrain_expr[,-1]
+midbrain_annotation<- read.table("/Users/david/Documents/SingleCellData/GitCloneWABI/E13.5-P7/DevMidBrain/Mouse_Embryo_fulldataset_annot.txt", header=TRUE,as.is=TRUE,check.names=FALSE,row.names=NULL,sep = "\t")
+row.names(midbrain_annotation) <- midbrain_annotation[,1]
+midbrain_annotation <- midbrain_annotation[,-1]
+
+ShGenesMidE13 <- intersect(row.names(midbrain_expr),row.names(emat_backSPIN))
+midbrainmerge <- subset(midbrain_expr,row.names(midbrain_expr) %in% ShGenesMidE13)
+E13merge <- subset(emat_backSPIN,row.names(emat_backSPIN)%in% ShGenesMidE13)
+E13Midbr <- cbind(E13merge,midbrainmerge)
+
+E13Midbrannotation <- as.data.frame(c(as.character(FinalClustersOrdered),midbrain_annotation[,1]))
+row.names(E13Midbrannotation) <- c(row.names(annotable_backSPIN),row.names(midbrain_annotation))
+colnames(E13Midbrannotation) <- c("E13MidClasses")
+
+CVsq <- function(x) {(sd(x)/mean(x))^2}
+emat_expressed <- apply(E13Midbr,1,function(x) any (x >= 1))
+#clusterNeuron <- subset(MNEclasses,MNEclasses %in% c("7","1","5"))
+emat_expressed <- E13Midbr[emat_expressed,]
+CV2 <- apply(emat_expressed,1,CVsq)
+meancounts <- apply(emat_expressed,1,mean)
+CV2_matrix <- matrix(c(log(meancounts),log(CV2)),nrow = length(CV2),ncol = 2)
+row.names(CV2_matrix) <- names(CV2)
+colnames(CV2_matrix) <- c("LogExpr","CV2")
+CV2_matrix <- as.data.frame(CV2_matrix)
+#plot(CV2_matrix,xlab ="Mean Count Magnitude (log)",ylab="Squared Coefficient of Variation", pch=20, cex=0.3)
+library(e1071)
+model <- svm(CV2 ~ LogExpr ,CV2_matrix, gamma = 0.06)
+predictedY <- predict(model, CV2_matrix)
+#plot(CV2_matrix,xlab ="Mean Count Magnitude (log)",ylab="Squared Coefficient of Variation", pch=20, cex=0.3)
+#points(CV2_matrix$LogExpr,predictedY, col="red",pch=20, cex=0.1)
+CV2_matrix <- cbind(CV2_matrix,predictedY)
+CV2_matrix$RelativeVariance <-CV2_matrix$CV2 - CV2_matrix$predictedY
+NetworkGenes <- row.names(subset(CV2_matrix, RelativeVariance > 1))
+NetworkGenesFactor <- as.factor(1*(CV2_matrix$RelativeVariance > 1))
+plot(CV2_matrix$LogExpr,CV2_matrix$CV2,xlab ="Mean Count Magnitude (log)",ylab="Squared Coefficient of Variation", pch=20, cex=0.3, col=NetworkGenesFactor)
+points(CV2_matrix$LogExpr,predictedY, col="green",pch=20, cex=0.1)
+length(NetworkGenes)
+
+#unique(E13Midbrannotation[,1])
+saveE13Midbr <- E13Midbr
+E13Midbr <- saveE13Midbr
+E13Midbr <- prcomp(log(t(E13Midbr[NetworkGenes,])+1),scale.=FALSE)
+E13Midbr <- as.data.frame(t(E13Midbr$x[,1:20]))
+E13Filtered <- E13Midbr[,row.names(subset(E13Midbrannotation,E13Midbrannotation[,1] %in% c("OPC1","OPC2","OPC3","COP","NFOL","Cycling","NP1a","NP1b","NP2","NP3","eVLMC","PLC","pnVLMC","VLMC")))]
+
+MidbrFiltered <- E13Midbr[,row.names(subset(E13Midbrannotation,E13Midbrannotation[,1] %in% levels(as.factor(midbrain_annotation$Cell_type))))]
+#"mNbML1","mRgl2","mNProg","mNbML4","mNbML5","mNbML3","mRgl3","mNbL2","mNbM","mNbDA","mRgl1","mNbL1","mNbML2"
+E13MidbrCor <- cor(E13Filtered,MidbrFiltered,method="pearson")
+E13MidbrCor <- cor(E13Midbr,E13Midbr,method="pearson")
+#E13MidbrCor <- cor(log(E13Filtered[NetworkGenes,]+1),log(MidbrFiltered[NetworkGenes,]+1),method="spearman")
+
+#Generate the subclass and average the correlation per group
+annotationE13 <- subset(E13Midbrannotation,E13Midbrannotation[,1] %in% c("OPC1","OPC2","OPC3","COP","NFOL","Cycling","NP1a","NP1b","NP2","NP3","eVLMC","PLC","pnVLMC","VLMC"))
+
+annotationMidbr <- subset(E13Midbrannotation,E13Midbrannotation[,1] %in% levels(as.factor(midbrain_annotation$Cell_type)))
+
+i=1
+Cormatrix <- data.frame()
+for(i in 1:length(unique(annotationE13[,1]))) {
+cluster <- unique(annotationE13[,1])[i]
+subclass <- E13MidbrCor[row.names(subset(annotationE13,annotationE13[,1] %in% cluster)),]
+ClusterCorAverage <- apply(subclass,2,mean)
+Cormatrix <- rbind(ClusterCorAverage,Cormatrix) }
+colnames(Cormatrix) <- colnames(E13MidbrCor)
+for(i in 1:length(unique(annotationMidbr[,1]))) {
+cluster <- unique(annotationMidbr[,1])[i]
+subclass <- Cormatrix[,row.names(subset(annotationMidbr,annotationMidbr[,1] %in% cluster))]
+ClusterCorAverage <- apply(subclass,1,mean)
+Cormatrix <- cbind(ClusterCorAverage,Cormatrix) }
+
+Cormatrix <- Cormatrix[1:length(unique(annotationE13[,1])),1:length(unique(annotationMidbr[,1]))]
+row.names(Cormatrix) <- rev(unique(annotationE13[,1]))
+colnames(Cormatrix) <- rev(unique(annotationMidbr[,1]))
+library(heatmap3)
+heatmap3(t(Cormatrix), Rowv = NULL , Colv = NULL ,scale = "none",filterFun = sd, method = "average",col=colorRampPalette(c("#2c7bb6","#ffffbf",
+"#d7191c"))(1024),balanceColor = T)
+```
+```{r, fig.width=5}
+tsne <- E13Midbr
+library(Rtsne)
+set.seed(123456789)
+tsne_out <- Rtsne(t(tsne), initial_dims=20, perplexity=60,max_iter = 1000,check_duplicates = FALSE,
+                  verbose = TRUE, theta = 0.0, pca = FALSE)
+rownames(tsne_out$Y) <- colnames(tsne)
+
+ggplot(as.data.frame(tsne_out$Y), aes(x=V1, y=V2, colour=as.factor(E13Midbrannotation$E13MidClasses))) +
+  geom_point(size=1) + geom_density2d(alpha=0.0,size=0.5, color="black", bins=10) +
+  theme(strip.background = element_blank(), strip.text.x = element_blank(),axis.text.x = element_blank(),axis.text.y= element_blank(),axis.ticks= element_blank(),axis.line  = element_blank(),panel.border = element_blank(),legend.position  = "right") + 
+  xlab("tSNE_1") + ylab("tSNE_2") + 
+  theme_bw() +
+  theme(axis.line = element_line(colour = "black"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       panel.border = element_blank(),
+       panel.background = element_blank())
+```
+Generate correlation with science 2016 dataset
+```{r, fig.width=5}
+ShGenesSc2016 <- intersect(row.names(expression_matrix),row.names(emat_backSPIN))
+Sc2016merge <- subset(expression_matrix,row.names(expression_matrix) %in% ShGenesSc2016)
+E13merge <- subset(emat_backSPIN,row.names(emat_backSPIN)%in% ShGenesSc2016)
+E13Sc2016 <- cbind(E13merge,Sc2016merge)
+Sc2016Anno <- annotable_feb[,2]
+names(Sc2016Anno) <- paste(row.names(annotable_feb),"2016",sep = "_")
+Sc2016Anno <- revalue(as.factor(Sc2016Anno),c("OPC"="OPC_2016",
+                                              "COP"="COP_2016",
+                                              "NFOL1"="NFOL1_2016",
+                                              "NFOL2"="NFOL2_2016",
+                                              "MFOL1"="MFOL1_2016",
+                                              "MFOL2"="MFOL2_2016",
+                                              "MOL1"="MOL1_2016",
+                                              "MOL2"="MOL2_2016",
+                                              "MOL3"="MOL3_2016",
+                                              "MOL4"="MOL4_2016",
+                                              "MOL5"="MOL5_2016",
+                                              "MOL6"="MOL6_2016",
+                                              "PPR"="VLMC_2016"))
+
+E13Sc2016annotation <- as.data.frame(c(as.character(FinalClustersOrdered),as.character(Sc2016Anno)))
+row.names(E13Sc2016annotation) <- c(row.names(annotable_backSPIN),names(Sc2016Anno))
+colnames(E13Sc2016annotation) <- c("E13Sc2016classes")
+colnames(E13Sc2016) <- row.names(E13Sc2016annotation)
+
+CVsq <- function(x) {(sd(x)/mean(x))^2}
+emat_expressed <- apply(E13Sc2016,1,function(x) any (x >= 1))
+#clusterNeuron <- subset(MNEclasses,MNEclasses %in% c("7","1","5"))
+emat_expressed <- E13Sc2016[emat_expressed,]
+CV2 <- apply(emat_expressed,1,CVsq)
+meancounts <- apply(emat_expressed,1,mean)
+CV2_matrix <- matrix(c(log(meancounts),log(CV2)),nrow = length(CV2),ncol = 2)
+row.names(CV2_matrix) <- names(CV2)
+colnames(CV2_matrix) <- c("LogExpr","CV2")
+CV2_matrix <- as.data.frame(CV2_matrix)
+#plot(CV2_matrix,xlab ="Mean Count Magnitude (log)",ylab="Squared Coefficient of Variation", pch=20, cex=0.3)
+library(e1071)
+model <- svm(CV2 ~ LogExpr ,CV2_matrix, gamma = 0.06)
+predictedY <- predict(model, CV2_matrix)
+#plot(CV2_matrix,xlab ="Mean Count Magnitude (log)",ylab="Squared Coefficient of Variation", pch=20, cex=0.3)
+#points(CV2_matrix$LogExpr,predictedY, col="red",pch=20, cex=0.1)
+CV2_matrix <- cbind(CV2_matrix,predictedY)
+CV2_matrix$RelativeVariance <-CV2_matrix$CV2 - CV2_matrix$predictedY
+NetworkGenes <- row.names(subset(CV2_matrix, RelativeVariance > 1))
+NetworkGenesFactor <- as.factor(1*(CV2_matrix$RelativeVariance > 1))
+plot(CV2_matrix$LogExpr,CV2_matrix$CV2,xlab ="Mean Count Magnitude (log)",ylab="Squared Coefficient of Variation", pch=20, cex=0.3, col=NetworkGenesFactor)
+points(CV2_matrix$LogExpr,predictedY, col="green",pch=20, cex=0.1)
+length(NetworkGenes)
+
+#unique(E13Sc2016annotation[,1])
+saveE13Sc2016 <- E13Sc2016
+E13Sc2016 <- saveE13Sc2016
+E13Sc2016 <- prcomp(log(t(E13Sc2016[NetworkGenes,])+1),scale.=FALSE)
+E13Sc2016 <- as.data.frame(t(E13Sc2016$x[,1:20]))
+E13Filtered <- E13Sc2016[,row.names(subset(E13Sc2016annotation,E13Sc2016annotation[,1] %in% c("OPC1","OPC2","OPC3","COP","NFOL","Cycling","NP1a","NP1b","NP2","NP3","eVLMC","PLC","pnVLMC","VLMC")))]
+
+Sc2016Filtered <- E13Sc2016[,row.names(subset(E13Sc2016annotation,E13Sc2016annotation[,1] %in% levels(Sc2016Anno)))]
+#"mNbML1","mRgl2","mNProg","mNbML4","mNbML5","mNbML3","mRgl3","mNbL2","mNbM","mNbDA","mRgl1","mNbL1","mNbML2"
+E13Sc2016Cor <- cor(E13Filtered,Sc2016Filtered,method="pearson")
+E13Sc2016Cor <- cor(E13Sc2016,E13Sc2016,method="pearson")
+#E13Sc2016Cor <- cor(log(E13Filtered[NetworkGenes,]+1),log(Sc2016Filtered[NetworkGenes,]+1),method="spearman")
+
+#Generate the subclass and average the correlation per group
+annotationE13 <- subset(E13Sc2016annotation,E13Sc2016annotation[,1] %in% c("OPC1","OPC2","OPC3","COP","NFOL","Cycling","NP1a","NP1b","NP2","NP3","eVLMC","PLC","pnVLMC","VLMC"))
+
+annotationSc2016 <- subset(E13Sc2016annotation,E13Sc2016annotation[,1] %in% levels(Sc2016Anno))
+
+i=1
+Cormatrix <- data.frame()
+for(i in 1:length(unique(annotationE13[,1]))) {
+cluster <- unique(as.character(annotationE13[,1]))[i]
+subclass <- E13Sc2016Cor[row.names(subset(annotationE13,annotationE13[,1] %in% cluster)),]
+ClusterCorAverage <- apply(subclass,2,mean)
+Cormatrix <- rbind(ClusterCorAverage,Cormatrix) 
+}
+colnames(Cormatrix) <- colnames(E13Sc2016Cor)
+for(i in 1:length(unique(annotationSc2016[,1]))) {
+cluster <- unique(as.character(annotationSc2016[,1]))[i]
+subclass <- Cormatrix[,row.names(subset(annotationSc2016,annotationSc2016[,1] %in% cluster))]
+ClusterCorAverage <- apply(subclass,1,mean)
+Cormatrix <- cbind(ClusterCorAverage,Cormatrix) 
+}
+
+Cormatrix <- Cormatrix[1:length(unique(as.character(annotationE13[,1]))),1:length(unique(annotationSc2016[,1]))]
+row.names(Cormatrix) <- rev(unique(as.character(annotationE13[,1])))
+colnames(Cormatrix) <- rev(unique(as.character(annotationSc2016[,1])))
+library(heatmap3)
+heatmap3(t(Cormatrix), Rowv = NULL , Colv = NULL ,scale = "none",filterFun = sd, method = "average",col=colorRampPalette(c("#2c7bb6","#ffffbf",
+"#d7191c"))(1024),balanceColor = T)
+```
+Additionally Generate Correlation with all E13.5 and P7 genes.
+```{r, fig.height=5}
+CVsq <- function(x) {(sd(x)/mean(x))^2}
+emat_expressed <- apply(emat_backSPIN,1,function(x) any ((x) >= 1))
+emat_expressed <- emat[emat_expressed,]
+CV2 <- apply(emat_expressed,1,CVsq)
+meancounts <- apply(emat_expressed,1,mean)
+CV2_matrix <- matrix(c(log(meancounts),log(CV2)),nrow = length(CV2),ncol = 2)
+row.names(CV2_matrix) <- names(CV2)
+colnames(CV2_matrix) <- c("LogExpr","CV2")
+CV2_matrix <- as.data.frame(CV2_matrix)
+#plot(CV2_matrix,xlab ="Mean Count Magnitude (log)",ylab="Squared Coefficient of Variation", pch=20, cex=0.3)
+library(e1071)
+model <- svm(CV2 ~ LogExpr ,CV2_matrix, gamma = 0.06)
+predictedY <- predict(model, CV2_matrix)
+#plot(CV2_matrix,xlab ="Mean Count Magnitude (log)",ylab="Squared Coefficient of Variation", pch=20, cex=0.3)
+#points(CV2_matrix$LogExpr,predictedY, col="red",pch=20, cex=0.1)
+CV2_matrix <- cbind(CV2_matrix,predictedY)
+CV2_matrix$RelativeVariance <-CV2_matrix$CV2 - CV2_matrix$predictedY
+NormGenes <- row.names(subset(CV2_matrix, RelativeVariance > 0.0))
+NormGenesFactor <- as.factor(1*(CV2_matrix$RelativeVariance > 0.0))
+plot(CV2_matrix$LogExpr,CV2_matrix$CV2,xlab ="Mean Count Magnitude (log)",ylab="Squared Coefficient of Variation", pch=20, cex=0.3, col=NormGenesFactor)
+points(CV2_matrix$LogExpr,predictedY, col="green",pch=20, cex=0.1)
+length(NormGenes)
+#unique(E13Sc2016annotation[,1])
+E13Sc2016 <- saveE13Sc2016
+E13Sc2016 <- prcomp(log(t(E13Sc2016[NormGenes,])+1),scale.=FALSE)
+E13Sc2016 <- as.data.frame(t(E13Sc2016$x[,1:30]))
+E13Filtered <- E13Sc2016[,row.names(subset(E13Sc2016annotation,E13Sc2016annotation[,1] %in% c("OPC1","OPC2","OPC3","COP","NFOL","Cycling","NP1a","NP1b","NP2","NP3","eVLMC","PLC","pnVLMC","VLMC")))]
+
+Sc2016Filtered <-  E13Sc2016[,row.names(subset(E13Sc2016annotation,E13Sc2016annotation[,1] %in% c("OPC1","OPC2","OPC3","COP","NFOL","Cycling","NP1a","NP1b","NP2","NP3","eVLMC","PLC","pnVLMC","VLMC")))]
+E13Sc2016Cor <- cor(E13Filtered,Sc2016Filtered,method="pearson")
+E13Sc2016Cor <- cor(E13Sc2016,E13Sc2016,method="pearson")
+#E13Sc2016Cor <- cor(log(E13Filtered[NetworkGenes,]+1),log(Sc2016Filtered[NetworkGenes,]+1),method="spearman")
+
+#Generate the subclass and average the correlation per group
+annotationE13 <- subset(E13Sc2016annotation,E13Sc2016annotation[,1] %in% c("OPC1","OPC2","OPC3","COP","NFOL","Cycling","NP1a","NP1b","NP2","NP3","eVLMC","PLC","pnVLMC","VLMC"))
+
+annotationSc2016 <- subset(E13Sc2016annotation,E13Sc2016annotation[,1] %in% c("OPC1","OPC2","OPC3","COP","NFOL","Cycling","NP1a","NP1b","NP2","NP3","eVLMC","PLC","pnVLMC","VLMC"))
+
+i=1
+Cormatrix <- data.frame()
+for(i in 1:length(unique(annotationE13[,1]))) {
+cluster <- unique(as.character(annotationE13[,1]))[i]
+subclass <- E13Sc2016Cor[row.names(subset(annotationE13,annotationE13[,1] %in% cluster)),]
+ClusterCorAverage <- apply(subclass,2,mean)
+Cormatrix <- rbind(ClusterCorAverage,Cormatrix) 
+}
+colnames(Cormatrix) <- colnames(E13Sc2016Cor)
+for(i in 1:length(unique(annotationSc2016[,1]))) {
+cluster <- unique(as.character(annotationSc2016[,1]))[i]
+subclass <- Cormatrix[,row.names(subset(annotationSc2016,annotationSc2016[,1] %in% cluster))]
+ClusterCorAverage <- apply(subclass,1,mean)
+Cormatrix <- cbind(ClusterCorAverage,Cormatrix) 
+}
+
+Cormatrix <- Cormatrix[1:length(unique(as.character(annotationE13[,1]))),1:length(unique(annotationSc2016[,1]))]
+row.names(Cormatrix) <- rev(unique(as.character(annotationE13[,1])))
+colnames(Cormatrix) <- rev(unique(as.character(annotationSc2016[,1])))
+library(heatmap3)
+heatmap3(t(Cormatrix), Rowv = NULL , Colv = NULL ,scale = "none",filterFun = sd, method = "average",col=colorRampPalette(c("#2c7bb6","#ffffbf",
+"#d7191c"))(1024),balanceColor = F)
+
+```
+Correlate the E13P7 dataset with itself properly.
+```{r, fig.height=5}
+#unique(E13Sc2016annotation[,1])
+BSPINcorrelation <- emat_backSPIN
+BSPINcorrelationannotation <- annotable_backSPIN
+
+CVsq <- function(x) {(sd(x)/mean(x))^2}
+emat_expressed <- apply(BSPINcorrelation,1,function(x) any ((x) >= 1))
+emat_expressed <- BSPINcorrelation[emat_expressed,]
+CV2 <- apply(emat_expressed,1,CVsq)
+meancounts <- apply(emat_expressed,1,mean)
+CV2_matrix <- matrix(c(log(meancounts),log(CV2)),nrow = length(CV2),ncol = 2)
+row.names(CV2_matrix) <- names(CV2)
+colnames(CV2_matrix) <- c("LogExpr","CV2")
+CV2_matrix <- as.data.frame(CV2_matrix)
+#plot(CV2_matrix,xlab ="Mean Count Magnitude (log)",ylab="Squared Coefficient of Variation", pch=20, cex=0.3)
+library(e1071)
+model <- svm(CV2 ~ LogExpr ,CV2_matrix, gamma = 0.06)
+predictedY <- predict(model, CV2_matrix)
+#plot(CV2_matrix,xlab ="Mean Count Magnitude (log)",ylab="Squared Coefficient of Variation", pch=20, cex=0.3)
+#points(CV2_matrix$LogExpr,predictedY, col="red",pch=20, cex=0.1)
+CV2_matrix <- cbind(CV2_matrix,predictedY)
+CV2_matrix$RelativeVariance <-CV2_matrix$CV2 - CV2_matrix$predictedY
+NormGenes <- row.names(subset(CV2_matrix, RelativeVariance > 0.0))
+NormGenesFactor <- as.factor(1*(CV2_matrix$RelativeVariance > 0.0))
+plot(CV2_matrix$LogExpr,CV2_matrix$CV2,xlab ="Mean Count Magnitude (log)",ylab="Squared Coefficient of Variation", pch=20, cex=0.3, col=NormGenesFactor)
+points(CV2_matrix$LogExpr,predictedY, col="green",pch=20, cex=0.1)
+length(NormGenes)
+
+TFsCorList <- intersect(NormGenes,AllTfsList)
+
+
+BSPINcorrelation <- prcomp(log(t(BSPINcorrelation[AllGenesFromAnalysis,])+1),scale.=FALSE)
+BSPINcorrelation <- as.data.frame(t(BSPINcorrelation$x[,1:20]))
+E13Filtered <- BSPINcorrelation[,row.names(subset(BSPINcorrelationannotation,BSPINcorrelationannotation[,10] %in% c("OPC1","OPC2","OPC3","COP","NFOL","Cycling","NP1a","NP1b","NP2","NP3","eVLMC","PLC","pnVLMC","VLMC")))]
+
+Sc2016Filtered <-  BSPINcorrelation[,row.names(subset(BSPINcorrelationannotation,BSPINcorrelationannotation[,10] %in% c("OPC1","OPC2","OPC3","COP","NFOL","Cycling","NP1a","NP1b","NP2","NP3","eVLMC","PLC","pnVLMC","VLMC")))]
+#BSPINcorrelationCor <- cor(E13Filtered,Sc2016Filtered,method="pearson")
+BSPINcorrelationCor <- cor(BSPINcorrelation,BSPINcorrelation,method="pearson")
+#BSPINcorrelationCor <- cor(log(E13Filtered[NetworkGenes,]+1),log(Sc2016Filtered[NetworkGenes,]+1),method="spearman")
+
+#Generate the subclass and average the correlation per group
+annotationE13 <- subset(BSPINcorrelationannotation,BSPINcorrelationannotation[,10] %in% c("OPC1","OPC2","OPC3","COP","NFOL","NP1a","NP1b","NP2","NP3","eVLMC","PLC","pnVLMC","VLMC"))
+
+annotationSc2016 <- subset(BSPINcorrelationannotation,BSPINcorrelationannotation[,10] %in% c("OPC1","OPC2","OPC3","COP","NFOL","NP1a","NP1b","NP2","NP3","eVLMC","PLC","pnVLMC","VLMC"))
+
+i=1
+Cormatrix <- data.frame()
+for(i in 1:length(unique(annotationE13[,10]))) {
+cluster <- unique(as.character(annotationE13[,10]))[i]
+subclass <- BSPINcorrelationCor[row.names(subset(annotationE13,annotationE13[,10] %in% cluster)),]
+ClusterCorAverage <- apply(subclass,2,mean)
+Cormatrix <- rbind(ClusterCorAverage,Cormatrix) 
+}
+colnames(Cormatrix) <- colnames(BSPINcorrelationCor)
+for(i in 1:length(unique(annotationSc2016[,10]))) {
+cluster <- unique(as.character(annotationSc2016[,10]))[i]
+subclass <- Cormatrix[,row.names(subset(annotationSc2016,annotationSc2016[,10] %in% cluster))]
+ClusterCorAverage <- apply(subclass,1,mean)
+Cormatrix <- cbind(ClusterCorAverage,Cormatrix) 
+}
+
+Cormatrix <- Cormatrix[1:length(unique(as.character(annotationE13[,10]))),1:length(unique(annotationSc2016[,10]))]
+row.names(Cormatrix) <- rev(unique(as.character(annotationE13[,10])))
+colnames(Cormatrix) <- rev(unique(as.character(annotationSc2016[,10])))
+library(heatmap3)
+heatmap3(t(Cormatrix), Rowv = NULL , Colv = NULL ,scale = "none",filterFun = sd, method = "average",col=colorRampPalette(c("#2c7bb6","#ffffbf",
+"#d7191c"))(1024),balanceColor =T)
+```
+
+```{r, fig.width=5}
+tsne <- E13Sc2016
+library(Rtsne)
+set.seed(123456789)
+tsne_out <- Rtsne(t(tsne), initial_dims=20, perplexity=60,max_iter = 1000,check_duplicates = FALSE,
+                  verbose = TRUE, theta = 0.0, pca = FALSE)
+rownames(tsne_out$Y) <- colnames(tsne)
+
+ggplot(as.data.frame(tsne_out$Y), aes(x=V1, y=V2, colour=as.factor(E13Sc2016annotation$E13Sc2016classes))) +
+  geom_point(size=1) + geom_density2d(alpha=0.0,size=0.5, color="black", bins=10) +
+  theme(strip.background = element_blank(), strip.text.x = element_blank(),axis.text.x = element_blank(),axis.text.y= element_blank(),axis.ticks= element_blank(),axis.line  = element_blank(),panel.border = element_blank(),legend.position  = "right") + 
+  xlab("tSNE_1") + ylab("tSNE_2") + 
+  theme_bw() +
+  theme(axis.line = element_line(colour = "black"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       panel.border = element_blank(),
+       panel.background = element_blank())
+```
+Generate correlation with science 2015 dataset
+```{r, fig.width=5}
+#Add Cortex 2015 data
+# open the expression file to start formatting the expression data for monocle, with header and indicating that the data is tab delimited. The check.names expression prevents any alteration of the data (so if anything goes wrong we know that it is because of the original data file)
+Cortex_expr <- read.table("/Users/david/Documents/SingleCellData/GitCloneWABI/E13.5-P7/cortex/expression_mRNA_17-Aug-2014_cortex_expr.txt", header=TRUE,as.is=TRUE,check.names=FALSE,row.names=NULL,sep = "\t")
+Cortex_expr <- Cortex_expr[!duplicated(Cortex_expr[,1]),]
+row.names(Cortex_expr) <- Cortex_expr[,1]
+Cortex_expr <- Cortex_expr[,-1]
+cortex_annotation<- read.table("/Users/david/Documents/SingleCellData/GitCloneWABI/E13.5-P7/cortex/expression_mRNA_17-Aug-2014_cortex_anno.txt", header=TRUE,as.is=TRUE,check.names=FALSE,row.names=NULL,sep = "\t")
+row.names(cortex_annotation) <- colnames(Cortex_expr)
+
+
+
+ShGenesSc2015 <- intersect(row.names(Cortex_expr),row.names(emat_backSPIN))
+Sc2015merge <- subset(Cortex_expr,row.names(Cortex_expr) %in% ShGenesSc2015)
+E13merge <- subset(emat_backSPIN,row.names(emat_backSPIN)%in% ShGenesSc2015)
+E13Sc2015 <- cbind(E13merge,Sc2015merge)
+Sc2015Anno <- as.factor(cortex_annotation[,10])
+names(Sc2015Anno) <- paste(row.names(cortex_annotation),"2015",sep = "_")
+#Sc2015Anno <- revalue(as.factor(Sc2015Anno),c("endothelial-mura"="endothelial-mural"))
+
+
+E13Sc2015annotation <- as.data.frame(c(as.character(FinalClustersOrdered),as.character(Sc2015Anno)))
+row.names(E13Sc2015annotation) <- c(row.names(annotable_backSPIN),names(Sc2015Anno))
+colnames(E13Sc2015annotation) <- c("E13Sc2015classes")
+colnames(E13Sc2015) <- row.names(E13Sc2015annotation)
+
+CVsq <- function(x) {(sd(x)/mean(x))^2}
+emat_expressed <- apply(E13Sc2015,1,function(x) any (x >= 1))
+#clusterNeuron <- subset(MNEclasses,MNEclasses %in% c("7","1","5"))
+emat_expressed <- E13Sc2015[emat_expressed,]
+CV2 <- apply(emat_expressed,1,CVsq)
+meancounts <- apply(emat_expressed,1,mean)
+CV2_matrix <- matrix(c(log(meancounts),log(CV2)),nrow = length(CV2),ncol = 2)
+row.names(CV2_matrix) <- names(CV2)
+colnames(CV2_matrix) <- c("LogExpr","CV2")
+CV2_matrix <- as.data.frame(CV2_matrix)
+#plot(CV2_matrix,xlab ="Mean Count Magnitude (log)",ylab="Squared Coefficient of Variation", pch=20, cex=0.3)
+library(e1071)
+model <- svm(CV2 ~ LogExpr ,CV2_matrix, gamma = 0.06)
+predictedY <- predict(model, CV2_matrix)
+#plot(CV2_matrix,xlab ="Mean Count Magnitude (log)",ylab="Squared Coefficient of Variation", pch=20, cex=0.3)
+#points(CV2_matrix$LogExpr,predictedY, col="red",pch=20, cex=0.1)
+CV2_matrix <- cbind(CV2_matrix,predictedY)
+CV2_matrix$RelativeVariance <-CV2_matrix$CV2 - CV2_matrix$predictedY
+NetworkGenes <- row.names(subset(CV2_matrix, RelativeVariance > 0))
+NetworkGenesFactor <- as.factor(1*(CV2_matrix$RelativeVariance > 0))
+plot(CV2_matrix$LogExpr,CV2_matrix$CV2,xlab ="Mean Count Magnitude (log)",ylab="Squared Coefficient of Variation", pch=20, cex=0.3, col=NetworkGenesFactor)
+points(CV2_matrix$LogExpr,predictedY, col="green",pch=20, cex=0.1)
+length(NetworkGenes)
+
+#unique(E13Sc2015annotation[,1])
+saveE13Sc2015 <- E13Sc2015
+E13Sc2015 <- saveE13Sc2015
+E13Sc2015 <- prcomp(log(t(E13Sc2015[NetworkGenes,])+1),scale.=FALSE)
+E13Sc2015 <- as.data.frame(t(E13Sc2015$x[,1:20]))
+E13Filtered <- E13Sc2015[,row.names(subset(E13Sc2015annotation,E13Sc2015annotation[,1] %in% c("OPC1","OPC2","OPC3","COP","NFOL1","NFOL2","MFOL","Cycling","NP1a","NP1b","NP2","NP3","eVLMC","PLC","pnVLMC","VLMC")))]
+
+Sc2015Filtered <- E13Sc2015[,row.names(subset(E13Sc2015annotation,E13Sc2015annotation[,1] %in% levels(Sc2015Anno)))]
+#"mNbML1","mRgl2","mNProg","mNbML4","mNbML5","mNbML3","mRgl3","mNbL2","mNbM","mNbDA","mRgl1","mNbL1","mNbML2"
+E13Sc2015Cor <- cor(E13Filtered,Sc2015Filtered,method="pearson")
+E13Sc2015Cor <- cor(E13Sc2015,E13Sc2015,method="pearson")
+#E13Sc2015Cor <- cor(log(E13Filtered[NetworkGenes,]+1),log(Sc2015Filtered[NetworkGenes,]+1),method="spearman")
+
+#Generate the subclass and average the correlation per group
+annotationE13 <- subset(E13Sc2015annotation,E13Sc2015annotation[,1] %in% c("OPC1","OPC2","OPC3","COP","NFOL1","NFOL2","MFOL","Cycling","NP1a","NP1b","NP2","NP3","eVLMC","PLC","pnVLMC","VLMC"))
+
+annotationSc2015 <- subset(E13Sc2015annotation,E13Sc2015annotation[,1] %in% levels(droplevels(Sc2015Anno)))
+i=1
+Cormatrix <- data.frame()
+for(i in 1:length(unique(annotationE13[,1]))) {
+cluster <- unique(as.character(annotationE13[,1]))[i]
+subclass <- E13Sc2015Cor[row.names(subset(annotationE13,annotationE13[,1] %in% cluster)),]
+ClusterCorAverage <- apply(subclass,2,mean)
+Cormatrix <- rbind(ClusterCorAverage,Cormatrix) 
+}
+
+colnames(Cormatrix) <- colnames(E13Sc2015Cor)
+for(i in 1:length(unique(annotationSc2015[,1]))) {
+cluster <- unique(as.character(annotationSc2015[,1]))[i]
+subclass <- Cormatrix[,row.names(subset(annotationSc2015,annotationSc2015[,1] %in% cluster))]
+ClusterCorAverage <- apply(subclass,1,mean)
+Cormatrix <- cbind(ClusterCorAverage,Cormatrix) 
+}
+
+Cormatrix <- Cormatrix[1:length(unique(as.character(annotationE13[,1]))),1:length(unique(annotationSc2015[,1]))]
+row.names(Cormatrix) <- rev(unique(as.character(annotationE13[,1])))
+colnames(Cormatrix) <- rev(unique(as.character(annotationSc2015[,1])))
+library(heatmap3)
+heatmap3(t(Cormatrix), Rowv = NULL , Colv = NULL ,scale = "none",filterFun = sd, method = "average",col=colorRampPalette(c("#2c7bb6","#ffffbf",
+"#d7191c"))(1024),balanceColor = T)
+```
+```{r, fig.width=5}
+tsne <- E13Sc2015
+library(Rtsne)
+set.seed(123456789)
+tsne_out <- Rtsne(t(tsne), initial_dims=20, perplexity=60,max_iter = 1000,check_duplicates = FALSE,
+                  verbose = TRUE, theta = 0.0, pca = FALSE)
+rownames(tsne_out$Y) <- colnames(tsne)
+
+ggplot(as.data.frame(tsne_out$Y), aes(x=V1, y=V2, colour=as.factor(E13Sc2015annotation$E13Sc2015classes))) +
+  geom_point(size=1) + geom_density2d(alpha=0.0,size=0.5, color="black", bins=10) +
+  theme(strip.background = element_blank(), strip.text.x = element_blank(),axis.text.x = element_blank(),axis.text.y= element_blank(),axis.ticks= element_blank(),axis.line  = element_blank(),panel.border = element_blank(),legend.position  = "right") + 
+  xlab("tSNE_1") + ylab("tSNE_2") + 
+  theme_bw() +
+  theme(axis.line = element_line(colour = "black"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       panel.border = element_blank(),
+       panel.background = element_blank())
+```
+Marker Table
+```{r}
+#create ggplot object
+levels(FinalClustersOrdered)
+emat_backSPINsordered <- as.data.frame(t(emat_backSPIN))
+emat_backSPINsordered$backSPINorder <- as.character(FinalClustersOrdered)
+emat_backSPINsordered$ordernames <- colnames(emat_backSPIN)
+emat_backSPINsordered <-arrange(emat_backSPINsordered,FinalClustersOrdered)
+emat_backSPINsplit <- as.data.frame(t(emat_backSPIN))
+emat_backSPINsplit$backSPINorder <- as.character(FinalClustersOrdered)
+emat_backSPINsplit <- split(emat_backSPINsplit,FinalClustersOrdered)
+library(reshape)
+emat_backSPINsordered <- merge_recurse(emat_backSPINsplit)
+#emat_clean_ordered <- do.call("rbind", emat_cleansplit)
+test <- as.data.frame(emat_backSPINsordered$backSPINorder)
+backSPINordered2 <- as.factor(emat_backSPINsordered$backSPINorder) 
+emat_backSPINsordered$order <- seq_len(nrow(emat_backSPINsordered))
+#backSPINordered2 <-factor(backSPINordered2,levels=c("OPC1","OPC2","COP","NP1","NP2","NP3","NP4"))
+```
+
+```{r, fig.height=1, fig.width=2}
+GlutGenes <- c("Gria1","Gria2","Gria3","Gria4","Grik1","Grik2","Grik3","Grik4","Grik5","Grin1","Grin2a","Grin2b","Grin2c","Grin2d","Grin3a","Grin3b")
+GlutChannels <- rowSums(as.data.frame(emat_backSPINsordered[,GlutGenes]))
+PottasiumGenes <- c("Kcnj2","Kcnj1","Kcnj12","Kcnj4","Kcnj14","Kcnj3","Kcnj6","Kcnj9","Kcnj10","Kcnj15","Kcnj16","Kcnj8","Kcnj11","Kcnj13","Kcna1","Kcna2","Kcna3","Kcna5","Kcna6","Kcnab1","Kcnab2","Kcnc1","Kcnc2","Kcnq1","Kcnq2","Kcnq3","Kcnh1","Kcnh2","Kcnh7","Kcna4","Kcnc3","Kcnc4","Kcnd1","Kcnd2","Kcnh5")
+PottasiumChannels <- rowSums(as.data.frame(emat_backSPINsordered[,PottasiumGenes]))
+VoltageGenes <- c("Scn1a","Scn3a","Scn8a","Scn9a","Scn10a","Scn11a","Scn1b","Scn2b","Scn3b","Scn4b")
+VoltageGated <- rowSums(as.data.frame(emat_backSPINsordered[,VoltageGenes]))
+
+LoadCycleGenes <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/EnrichedGenesPerPopulation/MarkerCycling.txt", header=TRUE,as.is=TRUE,check.names=FALSE,row.names=1)
+LoadOPC3Genes <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/EnrichedGenesPerPopulation/MarkerOPC3.txt", header=TRUE,as.is=TRUE,check.names=FALSE,row.names=1)
+LoadGOcycleGenes <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/CellcycleGO_0007049.txt", header=FALSE,as.is=TRUE,check.names=FALSE,row.names=1)
+TopCycle <-row.names(head(LoadCycleGenes[order(LoadCycleGenes$cZ,LoadCycleGenes$ce, decreasing  =  TRUE),],n=20))
+TopOPC3 <-row.names(head(LoadOPC3Genes[order(LoadOPC3Genes$cZ,LoadOPC3Genes$ce, decreasing  =  TRUE),],n=50))
+GOcycle <- LoadGOcycleGenes$V2
+GOcycle <- intersect(GOcycle,row.names(emat_backSPIN))
+CycleGenesInt <- intersect(TopCycle,TopOPC3)
+#Cycle <- prcomp(t(log(emat_backSPIN[GOcycle,]+1)),scale. = FALSE)
+#normalize <- function(x) {x / sqrt(sum(x^2))}
+#Cycle <- pca$x[,c(1)]
+Cycle <- rowSums(as.data.frame(emat_backSPINsordered[,GOcycle]))
+names(Cycle) <- row.names(emat_backSPINsordered)
+
+backSPINordered2 <- factor(backSPINordered2, levels=c("OPC1","OPC2","OPC3","COP","NFOL","Cycling","NP1a","NP1b","NP2","NP3","eVLMC","PLC","pnVLMC","VLMC"))
+
+
+emat_backSPINorderedfix <- as.data.frame(emat_backSPINsordered)
+```
+```{r}
+palette <- c("#c6dbef","#6baed6","#08519c","#006d2c","#41ab5d","#000000","#cab2d6","#6a3d9a","#dadaeb","#c994c7","#fcbba1","#ef3b2c","#a63603","#f16913")
+ggplot(data=emat_backSPINorderedfix, aes(x=emat_backSPINorderedfix$order, y=emat_backSPINorderedfix$Myc ,fill=backSPINordered2)) + (scale_fill_manual(backSPINordered2,values=palette))+ 
+    geom_bar(stat="identity",show.legend =TRUE)+ xlab("")+  ylab("Myc") +
+  theme(axis.title.x=element_blank(), 
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) + #+ geom_errorbar(aes(ymin=gene-ci,ymax=gene+ci,width=.1,position=position_dodge(.9)))
+theme_bw() +
+  theme(axis.line = element_line(colour = "black"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    panel.background = element_blank(),legend.position  = "right") 
+
+ggsave("~/Documents/Projects/Papers/E13.5-P7/Figures/IPA/NP_OPC/Myc.pdf", width = 10, height = 1)
+```
+```{r}
+unique(backSPINordered2)
+
+i=1
+Cyclematrix <- data.frame()
+for(i in 1:length(unique(backSPINordered2))) {
+cluster <- levels(backSPINordered2)[i]
+subclass <- subset(Cycle,backSPINordered2 %in% cluster)
+ClusterAverage <- mean(subclass)
+Cyclematrix <- rbind(ClusterAverage,Cyclematrix) 
+}
+row.names(Cyclematrix) <- rev(levels(backSPINordered2))
+colnames(Cyclematrix) <- "AverageCounts"
+
+backSPINPopBar <- as.factor(row.names(Cyclematrix))
+backSPINPopBar <- factor(backSPINPopBar, levels=c("Cycling","OPC1","OPC2","OPC3","NP1a","NP1b","NP2","NP3","eVLMC","PLC","pnVLMC","VLMC"))
+
+palette <- c("#000000","#c6dbef","#6baed6","#08519c","#cab2d6","#6a3d9a","#dadaeb","#c994c7","#fcbba1","#ef3b2c","#a63603","#f16913")
+
+#reorder(backSPINPopBar,-AverageCounts)
+ggplot(Cyclematrix, aes(x=backSPINPopBar, y=AverageCounts ,fill=backSPINPopBar)) + (scale_fill_manual(backSPINPopBar,values=palette))+ 
+    geom_bar(stat="identity",show.legend =TRUE)+ xlab("") + ylab("Cumulative expression Cycling GO:000749") +
+  theme(axis.title.x=element_blank(), 
+        axis.ticks.x=element_blank()) + #+ geom_errorbar(aes(ymin=gene-ci,ymax=gene+ci,width=.1,position=position_dodge(.9)))
+theme_bw() +
+  theme(axis.line = element_line(colour = "black"),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    panel.background = element_blank(),legend.position  = "right") 
+
+ggsave("~/Documents/Projects/Papers/E13.5-P7/Figures/Figure4/4dcustomorder.pdf", width = 5, height = 6)
+```
+```{r}
+#networkExpressionFile <- emat_backSPIN
+#networkAnnotableFile <- annotable_backSPIN
+
+#networkExpressionFile <- ematSpCrd
+#networkAnnotableFile <- annotable_backSPINSpCrd
+
+#networkExpressionFile <- ematBrain
+#networkAnnotableFile <- annotable_backSPINBrain
+
+#networkExpressionFile <- ematSpCrdnoVLMC
+#networkAnnotableFile <- annotable_backSPINSpCrdnoVLMC
+
+#networkExpressionFile <- ematBrainnoVLMC
+#networkAnnotableFile <- annotable_backSPINBrainnoVLMC
+
+#networkExpressionFile <- ematOPCs
+#networkAnnotableFile <- annotable_OPCs
+
+#networkExpressionFile <- lineageOPCs
+#networkAnnotableFile <- annotable_LinTraceOPCs
+
+#networkExpressionFile <- midbrain_expr
+#networkAnnotableFile <- midbrain_annotation
+
+#networkExpressionFile <- ematNPs
+#networkAnnotableFile <- annotable_backSPINNPs
+
+#networkExpressionFile <- ematVLMCs
+#networkAnnotableFile <- annotable_backSPINVLMCs
+
+#networkExpressionFile <- expression_matrix
+#networkAnnotableFile <- annotable_feb
+
+
+CVsq <- function(x) {(sd(x)/mean(x))^2}
+emat_expressed <- apply(networkExpressionFile,1,function(x) any ((x) >= 1))
+emat_expressed <- networkExpressionFile[emat_expressed,]
+CV2 <- apply(emat_expressed,1,CVsq)
+meancounts <- apply(emat_expressed,1,mean)
+CV2_matrix <- matrix(c(log(meancounts),log(CV2)),nrow = length(CV2),ncol = 2)
+row.names(CV2_matrix) <- names(CV2)
+colnames(CV2_matrix) <- c("LogExpr","CV2")
+CV2_matrix <- as.data.frame(CV2_matrix)
+#plot(CV2_matrix,xlab ="Mean Count Magnitude (log)",ylab="Squared Coefficient of Variation", pch=20, cex=0.3)
+library(e1071)
+model <- svm(CV2 ~ LogExpr ,CV2_matrix, gamma = 0.06)
+predictedY <- predict(model, CV2_matrix)
+#plot(CV2_matrix,xlab ="Mean Count Magnitude (log)",ylab="Squared Coefficient of Variation", pch=20, cex=0.3)
+#points(CV2_matrix$LogExpr,predictedY, col="red",pch=20, cex=0.1)
+CV2_matrix <- cbind(CV2_matrix,predictedY)
+CV2_matrix$RelativeVariance <-CV2_matrix$CV2 - CV2_matrix$predictedY
+NormGenes <- row.names(subset(CV2_matrix, RelativeVariance >= 0.5))
+NormGenesFactor <- as.factor(1*(CV2_matrix$RelativeVariance >= 0.5))
+plot(CV2_matrix$LogExpr,CV2_matrix$CV2,xlab ="Mean Count Magnitude (log)",ylab="Squared Coefficient of Variation", pch=20, cex=0.3, col=NormGenesFactor)
+points(CV2_matrix$LogExpr,predictedY, col="green",pch=20, cex=0.1)
+length(NormGenes)
+
+#TFsCorList <- intersect(NormGenes,AllTfsList)
+
+emat_boolean <- as.data.frame(t((1*(apply(networkExpressionFile[NormGenes,],1,function(x) (x) >= 1)))))
+
+library(amap)
+library(MASS)
+library(destiny)
+library(dpt)
+
+
+cd_diffusionplot <- t(log(networkExpressionFile[NormGenes,]+1))
+cd_diffusionplot <- cd_diffusionplot[!duplicated(cd_diffusionplot),]
+ts <- Transitions(cd_diffusionplot)
+pt <- dpt(ts, branching = TRUE)
+cd_diffusionggplot <- eigen(as.matrix(ts@transitions), TRUE)$vectors
+dm <- as.data.frame(cd_diffusionggplot[, -1])
+colnames(dm) <- paste0('DC', seq_len(ncol(dm)))
+#qplot(DC1, DC2, data = dm, colour = as.factor(networkAnnotableFile[,10]))
+#plot_dpt(ts, pt, 1:2) # DPT and average path
+ #cd_diffusionggplot <- fortify(ts)
+ # cd_diffusionplot <- DiffusionMap(cd_diffusionplot)
+  #cd_diffusionggplot <- fortify(cd_diffusionplot)
+  
+  boolean_diffusionplot <- t(log(networkExpressionFile[NormGenes,colnames(networkExpressionFile)]+1))
+    boolean_diffusionplot <- boolean_diffusionplot[!duplicated(boolean_diffusionplot),]
+    boolean_diffusionplot <- Transitions(boolean_diffusionplot)
+    boolean_diffusionggplot <- eigen(as.matrix(boolean_diffusionplot@transitions), TRUE)$vectors
+
+ #boolean_diffusionplot <- DiffusionMap(boolean_diffusionplot)
+ # boolean_diffusionggplot <- fortify(boolean_diffusionplot)
+  
+nDcellspace <- t(cd_diffusionggplot[,1:30])
+colnames(nDcellspace) <- row.names(cd_diffusionplot)
+#expr <- emat_clean[NormGenes,]
+
+nDcellspace <- as.matrix(Dist(t(nDcellspace),method = "pearson",nbproc = 8))
+nDcellspacePearson <- t(boolean_diffusionggplot[,1:6])
+colnames(nDcellspacePearson) <- row.names(cd_diffusionplot)
+#pca <- prcomp(t(log(emat_boolean[NormGenes,]+1)),scale. = FALSE)
+#nDcellspacePearson <- t(pca$x[,c(1:6)])
+```
+```{r, echo=TRUE, fig.height=5}
+i=1
+NNnumber=10
+SCC = 0.1
+Edgelist <- matrix(nrow = ncol(nDcellspace)*NNnumber,ncol = 5)
+perc=0
+for(i in 1:ncol(nDcellspace)) 
+{
+  x <- nDcellspace
+  x <- x[order(x[,colnames(nDcellspace)[i]]),colnames(nDcellspace)[i],drop = FALSE][1:(NNnumber+1),1,drop=FALSE]
+  colnames(x) <- row.names(x)[1]
+  x <- as.data.frame(x[-1,,drop = FALSE])
+  x$Pearson <- (cor(nDcellspacePearson[,c(row.names(x),colnames(x))], method = "pearson")[-(NNnumber+1),colnames(x)])^30
+  x$Strong <- 1*(x$Pearson > SCC)
+  loop=1
+  while(sum(x$Strong) < 5 & loop<0){ SCCloop = SCC-(0.0*loop)
+    x$Strong <- 1*(x$Pearson > SCCloop)
+    loop=loop+1
+    }
+  tempEdgelist <- cbind(colnames(x[1]),row.names(x),x[1:3])
+  Edgelist[((i*NNnumber)-(NNnumber-1)):(i*NNnumber),] <- rbind(as.matrix(tempEdgelist))
+  colnames(Edgelist) <- c("Source","Target","EuclideanDistance","Pearson","Strong")
+    if (perc >= ncol(nDcellspace)*0.1)
+    {
+      print(paste(round((i/ncol(nDcellspace)*100),0), " %")) 
+      perc = 1
+    }
+    else 
+    {
+      perc = perc +1
+      # print(paste(round((i/ncol(nDcellspace)*100),digits = 2)))#," Number of Genes ",length(b)))
+    }
+    if ((i/ncol(nDcellspace)*100) == 100)
+    {
+      Edgelist <- as.data.frame(Edgelist)
+      Edgelist <- dplyr::filter(Edgelist, Strong == 1)
+      Edgelist$Source <- as.character(Edgelist$Source)
+      Edgelist$Target <- as.character(Edgelist$Target)
+      Edgelist$EuclideanDistance <- as.numeric(Edgelist$EuclideanDistance)
+      Edgelist$Pearson <- as.numeric(Edgelist$Pearson)
+      #Edgelist$Pearson <- as.numeric(levels(Edgelist$Pearson))[Edgelist$Pearson]
+      print("Done.")
+    }
+}
+plot(density(Edgelist$Pearson))
+
+testMNE <- graph.data.frame(Edgelist,directed = FALSE, vertices = NULL)
+distcells <- distances(testMNE,weights = E(testMNE)$Pearson, algorithm = "johnson",)
+filterNetwork <- row.names(distcells[is.finite(distcells[,row.names(networkAnnotableFile[10,])]),])
+testMNE <- subgraph(testMNE,filterNetwork)
+summary(testMNE)
+E(testMNE)$Pearson <-  E(testMNE)$Pearson#*100
+cwt <- cluster_walktrap(testMNE, weights = E(testMNE)$Pearson, steps = 100,merges = TRUE, modularity = TRUE, membership = TRUE)
+MNEclasses <- as.character(membership(cwt))
+names(MNEclasses) <- names(membership(cwt))
+table(MNEclasses)
+length(MNEclasses)
+
+#write to file
+iGraph_edgelist <- cbind(get.edgelist(testMNE,names = TRUE),E(testMNE)$Pearson)
+write.table(iGraph_edgelist,file = "DiffusionNetworkOligoEdgelist.txt", sep="\t",row.names = FALSE, col.names = TRUE, quote = FALSE)
+annotable_randomwalk <- networkAnnotableFile[V(testMNE),]
+annotable_randomwalk$randomwalkclust <- MNEclasses
+Filterednetwork <- networkAnnotableFile[names(MNEclasses),1] 
+annotable_randomwalk$rbackSPIN <- Filterednetwork
+write.table(cbind(annotable_randomwalk[unique(Edgelist$Source),],row.names(annotable_randomwalk[unique(Edgelist$Source),])),file = "DiffNetworkannotation.txt", sep="\t",row.names = FALSE, col.names = TRUE, quote = FALSE)
+
+
+l <- layout_with_fr(testMNE, grid = "grid", weights = E(testMNE)$Pearson, start.temp = sqrt(vcount(testMNE)), niter = 100000)
+FilteredbackSPIN <- networkAnnotableFile[names(MNEclasses),10] 
+FilteredbackSPIN <- factor(FilteredbackSPIN, levels=c("OPC1","OPC2","OPC3","COP","NFOL","Cycling","NP1a","NP1b","NP2","NP3","eVLMC","PLC","pnVLMC","VLMC"))
+palette <- c("#c6dbef","#6baed6","#08519c","#006d2c","#41ab5d","#000000","#cab2d6","#6a3d9a","#dadaeb","#c994c7","#fcbba1","#ef3b2c","#a63603","#f16913")
+
+#palette <- rainbow(length(levels(as.factor(FilteredbackSPIN))))
+cols <- palette[as.factor(FilteredbackSPIN)]
+plot.igraph(testMNE, layout=l, vertex.size=3, vertex.label=NA,vertex.color=cols,edge.color="black",edge.width=(E(testMNE)$Pearson))
+legend("topright", legend=levels(as.factor(FilteredbackSPIN)),
+   col=palette,
+   pch=19)
+
+palette <- rainbow(length(levels(as.factor(MNEclasses))))
+cols <- palette[as.factor(MNEclasses)]
+plot.igraph(testMNE, layout=l, vertex.size=2, vertex.label=NA,vertex.color=cols,edge.color="black",edge.width=(E(testMNE)$Pearson))
+legend("topright", legend=levels(as.factor(MNEclasses)),
+   col=palette,
+   pch=19)
+Expression <- as.data.frame(t(log(networkExpressionFile[,names(MNEclasses)]+1)))
+#display.brewer.all()
+rbPal <- colorRampPalette(brewer.pal(9,"YlOrRd"))
+cols <- rbPal(100)[as.numeric(cut(Expression$Dcn,breaks = 100))]
+
+plot.igraph(testMNE, layout=l, vertex.size=5, vertex.label=NA,vertex.color=cols,edge.color="black",edge.width=(E(testMNE)$Pearson))
+
+```
+GO-term visualization
+```{r}
+#Convert to gencode using biomart
+listMarts()
+ensembl = useMart("ensembl",dataset="mmusculus_gene_ensembl")
+listDatasets(ensembl)
+attributes = listAttributes(ensembl)
+Biomart_gencode_ensembl84_biotypes <- getBM(attributes=c("mgi_symbol","ensembl_gene_id","entrezgene","gene_biotype"), filters = "", values = "", ensembl)
+Biomart_gencode_ensembl84_biotypes[, 'gene_biotype'] <- as.factor(Biomart_gencode_ensembl84_biotypes[,'gene_biotype'])
+#Filter for only our genes
+Biotype_All_dataset <- subset(Biomart_gencode_ensembl84_biotypes, mgi_symbol %in% row.names(emat_backSPIN))
+emat_expressed <- apply(emat_backSPIN,1,function(x) any ((x) >= 1))
+emat_expressed <- emat_backSPIN[emat_expressed,]
+exp.m <- emat_expressed
+entrezID <-  subset(Biotype_All_dataset, Biotype_All_dataset$mgi_symbol %in% row.names(exp.m))
+entrezmatched <- entrezID[match(row.names(emat_backSPIN),entrezID$mgi_symbol),]
+entrezID <- entrezID[! apply(entrezID[,c(1,3)], 1,function (x) anyNA(x)),]
+allLLIDs <- entrezmatched$entrezgene
+
+library(WGCNA)
+
+setwd("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/DendoComparisons/")
+Diff_exp <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/DendoComparisons/Lev1A_OLsVSNP_VLMCs.txt",header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+DiffDown.exp <- Diff_exp[(Diff_exp$Z < 0) & (Diff_exp$pvalue < 0.01), ]
+DiffUP.exp <- Diff_exp[(Diff_exp$Z > 0) & (Diff_exp$pvalue < 0.01), ]
+OL_VS_np_vlmcs <- intersect(AllTfsList,row.names(DiffUP.exp))
+OL_VS_np_vlmcs <- DiffUP.exp[OL_VS_np_vlmcs,]
+ol_VS_NP_VLMCs <- intersect(AllTfsList,row.names(DiffDown.exp))
+ol_VS_NP_VLMCs <- DiffDown.exp[ol_VS_NP_VLMCs,]
+DOWN <- row.names(emat_backSPIN) %in% row.names(DiffDown.exp)*1
+UP <- row.names(emat_backSPIN) %in% row.names(DiffUP.exp)*1
+GOenr = GOenrichmentAnalysis(UP, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/GO_OL_VS_np_vlmcs.txt", sep = "\t")
+GOenr = GOenrichmentAnalysis(DOWN, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/GO_ol_VS_NP_VLMCs2.txt", sep = "\t")
+
+
+Diff_exp <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/DendoComparisons/Lev1B_NPsVSVLMCs.txt",header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+DiffDown.exp <- Diff_exp[(Diff_exp$Z < 0) & (Diff_exp$pvalue < 0.01), ]
+DiffUP.exp <- Diff_exp[(Diff_exp$Z > 0) & (Diff_exp$pvalue < 0.01), ]
+NPsVSvlmcs <- intersect(AllTfsList,row.names(DiffUP.exp))
+NPsVSvlmcs <- DiffUP.exp[NPsVSvlmcs,]
+npsVSVLMCs <- intersect(AllTfsList,row.names(DiffDown.exp))
+npsVSVLMCs <- DiffDown.exp[npsVSVLMCs,]
+DOWN <- row.names(emat_backSPIN) %in% row.names(DiffDown.exp)*1
+UP <- row.names(emat_backSPIN) %in% row.names(DiffUP.exp)*1
+GOenr = GOenrichmentAnalysis(UP, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/GO_NPsVSvlmcs.txt", sep = "\t")
+GOenr = GOenrichmentAnalysis(DOWN, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/GO_npsVSVLMCs2.txt", sep = "\t")
+
+Diff_exp <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/DendoComparisons/lev2aOPCsVSCOPNFOLMFOL.txt",header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+DiffDown.exp <- Diff_exp[(Diff_exp$Z < 0) & (Diff_exp$pvalue < 0.01), ]
+DiffUP.exp <- Diff_exp[(Diff_exp$Z > 0) & (Diff_exp$pvalue < 0.01), ]
+OPCsVScopnfol <- intersect(AllTfsList,row.names(DiffUP.exp))
+OPCsVScopnfol <- DiffUP.exp[OPCsVScopnfol,]
+opcsVSCOPNFOLMFOL <- intersect(AllTfsList,row.names(DiffDown.exp))
+opcsVSCOPNFOLMFOL <- DiffDown.exp[opcsVSCOPNFOLMFOL,]
+DOWN <- row.names(emat_backSPIN) %in% row.names(DiffDown.exp)*1
+UP <- row.names(emat_backSPIN) %in% row.names(DiffUP.exp)*1
+GOenr = GOenrichmentAnalysis(UP, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/GO_OPCsVScopnfol.txt", sep = "\t")
+GOenr = GOenrichmentAnalysis(DOWN, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/GO_opcsVSCOPNFOLMFOL2.txt", sep = "\t")
+
+Diff_exp <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/DendoComparisons/Lev3B_OPC12VSOPC3.txt",header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+DiffDown.exp <- Diff_exp[(Diff_exp$Z < 0) & (Diff_exp$pvalue < 0.01), ]
+DiffUP.exp <- Diff_exp[(Diff_exp$Z > 0) & (Diff_exp$pvalue < 0.01), ]
+OPC12VSopc3 <- intersect(AllTfsList,row.names(DiffUP.exp))
+OPC12VSopc3 <- DiffUP.exp[OPC12VSopc3,]
+opc12VSOPC3 <- intersect(AllTfsList,row.names(DiffDown.exp))
+opc12VSOPC3 <- DiffDown.exp[opc12VSOPC3,]
+DOWN <- row.names(emat_backSPIN) %in% row.names(DiffDown.exp)*1
+UP <- row.names(emat_backSPIN) %in% row.names(DiffUP.exp)*1
+GOenr = GOenrichmentAnalysis(UP, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/GO_OPC12VSopc3.txt", sep = "\t")
+GOenr = GOenrichmentAnalysis(DOWN, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/GO_opc12VSOPC32.txt", sep = "\t")
+
+
+Diff_exp <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/DendoComparisons/Lev3C_NP2VSNP3and1.txt",header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+DiffDown.exp <- Diff_exp[(Diff_exp$Z < 0) & (Diff_exp$pvalue < 0.01), ]
+DiffUP.exp <- Diff_exp[(Diff_exp$Z > 0) & (Diff_exp$pvalue < 0.01), ]
+NP2VSnp3and1 <- intersect(AllTfsList,row.names(DiffUP.exp))
+NP2VSnp3and1 <- DiffUP.exp[NP2VSnp3and1,]
+np2VSNP3and1 <- intersect(AllTfsList,row.names(DiffDown.exp))
+np2VSNP3and1 <- DiffDown.exp[np2VSNP3and1,]
+DOWN <- row.names(emat_backSPIN) %in% row.names(DiffDown.exp)*1
+UP <- row.names(emat_backSPIN) %in% row.names(DiffUP.exp)*1
+GOenr = GOenrichmentAnalysis(UP, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/GO_NP2VSnp3and1.txt", sep = "\t")
+GOenr = GOenrichmentAnalysis(DOWN, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/GO_np2VSNP3and12.txt", sep = "\t")
+
+Diff_exp <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/DendoComparisons/Lev3D_pnVLMC_VLMC_VS_eVLMC_PLC.txt",header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+DiffDown.exp <- Diff_exp[(Diff_exp$Z < 0) & (Diff_exp$pvalue < 0.01), ]
+DiffUP.exp <- Diff_exp[(Diff_exp$Z > 0) & (Diff_exp$pvalue < 0.01), ]
+pnVLMC_VLMC_VS_evlmc_plc <- intersect(AllTfsList,row.names(DiffUP.exp))
+pnVLMC_VLMC_VS_evlmc_plc <- DiffUP.exp[pnVLMC_VLMC_VS_evlmc_plc,]
+pnvlmc_vlmc_VS_eVLMC_PLC <- intersect(AllTfsList,row.names(DiffDown.exp))
+pnvlmc_vlmc_VS_eVLMC_PLC <- DiffDown.exp[pnvlmc_vlmc_VS_eVLMC_PLC,]
+DOWN <- row.names(emat_backSPIN) %in% row.names(DiffDown.exp)*1
+UP <- row.names(emat_backSPIN) %in% row.names(DiffUP.exp)*1
+GOenr = GOenrichmentAnalysis(UP, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/GO_pnVLMC_VLMC_VS_evlmc_plc.txt", sep = "\t")
+GOenr = GOenrichmentAnalysis(DOWN, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/GO_pnvlmc_vlmc_VS_eVLMC_PLC2.txt", sep = "\t")
+
+Diff_exp <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/DendoComparisons/Lev4b_OPC1_VS_OPC2.txt",header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+DiffDown.exp <- Diff_exp[(Diff_exp$Z < 0) & (Diff_exp$pvalue < 0.01), ]
+DiffUP.exp <- Diff_exp[(Diff_exp$Z > 0) & (Diff_exp$pvalue < 0.01), ]
+OPC1_VS_opc2 <- intersect(AllTfsList,row.names(DiffUP.exp))
+OPC1_VS_opc2 <- DiffUP.exp[OPC1_VS_opc2,]
+opc1_VS_OPC2 <- intersect(AllTfsList,row.names(DiffDown.exp))
+opc1_VS_OPC2 <- DiffDown.exp[opc1_VS_OPC2,]
+DOWN <- row.names(emat_backSPIN) %in% row.names(DiffDown.exp)*1
+UP <- row.names(emat_backSPIN) %in% row.names(DiffUP.exp)*1
+GOenr = GOenrichmentAnalysis(UP, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/GO_OPC1_VS_opc2.txt", sep = "\t")
+GOenr = GOenrichmentAnalysis(DOWN, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/GO_opc1_VS_OPC22.txt", sep = "\t")
+
+Diff_exp <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/DendoComparisons/Lev4b_OPC1_VS_OPC2_batch_correctedtest.txt",header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+DiffDown.exp <- Diff_exp[(Diff_exp$Z < 0) & (Diff_exp$pvalue < 0.01), ]
+DiffUP.exp <- Diff_exp[(Diff_exp$Z > 0) & (Diff_exp$pvalue < 0.01), ]
+OPC1_VS_opc2 <- intersect(AllTfsList,row.names(DiffUP.exp))
+OPC1_VS_opc2 <- DiffUP.exp[OPC1_VS_opc2,]
+opc1_VS_OPC2 <- intersect(AllTfsList,row.names(DiffDown.exp))
+opc1_VS_OPC2 <- DiffDown.exp[opc1_VS_OPC2,]
+DOWN <- row.names(emat_backSPIN) %in% row.names(DiffDown.exp)*1
+UP <- row.names(emat_backSPIN) %in% row.names(DiffUP.exp)*1
+GOenr = GOenrichmentAnalysis(UP, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/GO_OPC1_VS_opc2_batch_correctedtest.txt", sep = "\t")
+GOenr = GOenrichmentAnalysis(DOWN, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/GO_opc1_VS_OPC22_batch_correctedtest.txt", sep = "\t")
+
+
+Diff_exp <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/DendoComparisons/Lev4c_NP3_VS_NP1.txt",header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+DiffDown.exp <- Diff_exp[(Diff_exp$Z < 0) & (Diff_exp$pvalue < 0.01), ]
+DiffUP.exp <- Diff_exp[(Diff_exp$Z > 0) & (Diff_exp$pvalue < 0.01), ]
+NP3_VS_np1 <- intersect(AllTfsList,row.names(DiffUP.exp))
+NP3_VS_np1 <- DiffUP.exp[NP3_VS_np1,]
+np3_VS_NP1 <- intersect(AllTfsList,row.names(DiffDown.exp))
+np3_VS_NP1 <- DiffDown.exp[np3_VS_NP1,]
+DOWN <- row.names(emat_backSPIN) %in% row.names(DiffDown.exp)*1
+UP <- row.names(emat_backSPIN) %in% row.names(DiffUP.exp)*1
+GOenr = GOenrichmentAnalysis(UP, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/GO_NP3_VS_np1.txt", sep = "\t")
+GOenr = GOenrichmentAnalysis(DOWN, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/GO_np3_VS_NP12.txt", sep = "\t")
+
+Diff_exp <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/DendoComparisons/Lev4d_pnVLMC_VS_VLMC.txt",header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+DiffDown.exp <- Diff_exp[(Diff_exp$Z < 0) & (Diff_exp$pvalue < 0.01), ]
+DiffUP.exp <- Diff_exp[(Diff_exp$Z > 0) & (Diff_exp$pvalue < 0.01), ]
+pnVLMC_VS_vlmc <- intersect(AllTfsList,row.names(DiffUP.exp))
+pnVLMC_VS_vlmc <- DiffUP.exp[pnVLMC_VS_vlmc,]
+pnvlmc_VS_VLMC <- intersect(AllTfsList,row.names(DiffDown.exp))
+pnvlmc_VS_VLMC <- DiffDown.exp[pnvlmc_VS_VLMC,]
+DOWN <- row.names(emat_backSPIN) %in% row.names(DiffDown.exp)*1
+UP <- row.names(emat_backSPIN) %in% row.names(DiffUP.exp)*1
+GOenr = GOenrichmentAnalysis(UP, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/GO_pnVLMC_VS_vlmc.txt", sep = "\t")
+GOenr = GOenrichmentAnalysis(DOWN, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/GO_pnvlmc_VS_VLMC2.txt", sep = "\t")
+
+Diff_exp <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/DendoComparisons/Lev5_NP1a_VS_NP1b.txt",header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+DiffDown.exp <- Diff_exp[(Diff_exp$Z < 0) & (Diff_exp$pvalue < 0.01), ]
+DiffUP.exp <- Diff_exp[(Diff_exp$Z > 0) & (Diff_exp$pvalue < 0.01), ]
+NP1a_VS_np1b <- intersect(AllTfsList,row.names(DiffUP.exp))
+NP1a_VS_np1b <- DiffUP.exp[NP1a_VS_np1b,]
+np1a_VS_NP1b <- intersect(AllTfsList,row.names(DiffDown.exp))
+np1a_VS_NP1b <- DiffDown.exp[np1a_VS_NP1b,]
+DOWN <- row.names(emat_backSPIN) %in% row.names(DiffDown.exp)*1
+UP <- row.names(emat_backSPIN) %in% row.names(DiffUP.exp)*1
+GOenr = GOenrichmentAnalysis(UP, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/GO_NP1a_VS_np1b.txt", sep = "\t")
+GOenr = GOenrichmentAnalysis(DOWN, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/GO_np1a_VS_NP1b2.txt", sep = "\t")
+
+Diff_exp <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/DendoComparisons/Lev4e_PLC_VS_eVLMC.txt",header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+DiffDown.exp <- Diff_exp[(Diff_exp$Z < 0) & (Diff_exp$pvalue < 0.01), ]
+DiffUP.exp <- Diff_exp[(Diff_exp$Z > 0) & (Diff_exp$pvalue < 0.01), ]
+PLC_VS_evlmc <- intersect(AllTfsList,row.names(DiffUP.exp))
+PLC_VS_evlmc <- DiffUP.exp[PLC_VS_evlmc,]
+plc_VS_eVLMC <- intersect(AllTfsList,row.names(DiffDown.exp))
+plc_VS_eVLMC <- DiffDown.exp[plc_VS_eVLMC,]
+DOWN <- row.names(emat_backSPIN) %in% row.names(DiffDown.exp)*1
+UP <- row.names(emat_backSPIN) %in% row.names(DiffUP.exp)*1
+GOenr = GOenrichmentAnalysis(UP, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/GO_PLC_VS_evlmc.txt", sep = "\t")
+GOenr = GOenrichmentAnalysis(DOWN, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/GO_plc_VS_eVLMC2.txt", sep = "\t")
+
+
+Diff_exp <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/DendoComparisons/Lev3A_COPVSNFOLMFOL.txt",header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+DiffDown.exp <- Diff_exp[(Diff_exp$Z < 0) & (Diff_exp$pvalue < 0.01), ]
+DiffUP.exp <- Diff_exp[(Diff_exp$Z > 0) & (Diff_exp$pvalue < 0.01), ]
+COPVSnfolmfol <- intersect(AllTfsList,row.names(DiffUP.exp))
+COPVSnfolmfol <- DiffUP.exp[COPVSnfolmfol,]
+copVSNFOLMFOL <- intersect(AllTfsList,row.names(DiffDown.exp))
+copVSNFOLMFOL <- DiffDown.exp[copVSNFOLMFOL,]
+DOWN <- row.names(emat_backSPIN) %in% row.names(DiffDown.exp)*1
+UP <- row.names(emat_backSPIN) %in% row.names(DiffUP.exp)*1
+GOenr = GOenrichmentAnalysis(UP, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/GO_COPVSnfolmfol.txt", sep = "\t")
+GOenr = GOenrichmentAnalysis(DOWN, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/GO_copVSNFOLMFOL2.txt", sep = "\t")
+
+GOenr = GOenrichmentAnalysis(DOWN, allLLIDs, organism = "mouse", nBestP = 20);
+tab = GOenr$bestPTerms[[4]]$enrichment
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/tab.txt", sep = "\t")
+
+
+
+head(Diff_exp[order(Diff_exp$Z, decreasing  =  TRUE), ],n=100)
+write.table(test.difffilter[order(abs(test.difffilter$pvalue), decreasing = FALSE), ], file ="~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/DendoComparisons/lev2aOPCsVSCOPNFOLMFOL.txt", row.names = TRUE, col.names = TRUE, sep = "\t", quote = FALSE)
+
+
+
+expressions <- lapply(file_names_Dendo,read.table,header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+names(expressions) <- file_names_Dendo
+DendoGenestop100 <-lapply(expressions,row.names)
+DendoGenestop100 <- sapply(DendoGenestop100,'[',1:10 ) 
+DendoGenestop100 <- unique(c(DendoGenestop100))
+
+GOenr = GOenrichmentAnalysis(moduleColors, allLLIDs, organism = "mouse", nBestP = 20);
+tab = GOenr$bestPTerms[[4]]$enrichment
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/tab.txt", sep = "\t")
+
+
+```
+Go-enriched
+```{r}
+#Convert to gencode using biomart
+listMarts()
+ensembl = useMart("ensembl",dataset="mmusculus_gene_ensembl")
+listDatasets(ensembl)
+attributes = listAttributes(ensembl)
+Biomart_gencode_ensembl84_biotypes <- getBM(attributes=c("mgi_symbol","ensembl_gene_id","entrezgene","gene_biotype"), filters = "", values = "", ensembl)
+Biomart_gencode_ensembl84_biotypes[, 'gene_biotype'] <- as.factor(Biomart_gencode_ensembl84_biotypes[,'gene_biotype'])
+#Filter for only our genes
+Biotype_All_dataset <- subset(Biomart_gencode_ensembl84_biotypes, mgi_symbol %in% row.names(emat_backSPIN))
+emat_expressed <- apply(emat_backSPIN,1,function(x) any ((x) >= 1))
+emat_expressed <- emat_backSPIN[emat_expressed,]
+exp.m <- emat_expressed
+entrezID <-  subset(Biotype_All_dataset, Biotype_All_dataset$mgi_symbol %in% row.names(exp.m))
+entrezmatched <- entrezID[match(row.names(emat_backSPIN),entrezID$mgi_symbol),]
+entrezID <- entrezID[! apply(entrezID[,c(1,3)], 1,function (x) anyNA(x)),]
+allLLIDs <- entrezmatched$entrezgene
+
+library(WGCNA)
+
+setwd("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/EnrichedGenesPerPopulation/")
+Diff_exp <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/EnrichedGenesPerPopulation/MarkerAllNPs.txt",header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+DiffDown.exp <- Diff_exp[(Diff_exp$Z < 0) & (Diff_exp$pvalue < 0.01), ]
+DiffUP.exp <- Diff_exp[(Diff_exp$Z > 0) & (Diff_exp$pvalue < 0.01), ]
+OL_VS_np_vlmcs <- intersect(AllTfsList,row.names(DiffUP.exp))
+OL_VS_np_vlmcs <- DiffUP.exp[OL_VS_np_vlmcs,]
+ol_VS_NP_VLMCs <- intersect(AllTfsList,row.names(DiffDown.exp))
+ol_VS_NP_VLMCs <- DiffDown.exp[ol_VS_NP_VLMCs,]
+DOWN <- row.names(emat_backSPIN) %in% row.names(DiffDown.exp)*1
+UP <- row.names(emat_backSPIN) %in% row.names(DiffUP.exp)*1
+GOenr = GOenrichmentAnalysis(UP, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/NPs.txt", sep = "\t")
+GOenr = GOenrichmentAnalysis(DOWN, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/NPs2.txt", sep = "\t")
+
+
+Diff_exp <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/EnrichedGenesPerPopulation/MarkerAllOLs.txt",header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+DiffDown.exp <- Diff_exp[(Diff_exp$Z < 0) & (Diff_exp$pvalue < 0.01), ]
+DiffUP.exp <- Diff_exp[(Diff_exp$Z > 0) & (Diff_exp$pvalue < 0.01), ]
+NPsVSvlmcs <- intersect(AllTfsList,row.names(DiffUP.exp))
+NPsVSvlmcs <- DiffUP.exp[NPsVSvlmcs,]
+npsVSVLMCs <- intersect(AllTfsList,row.names(DiffDown.exp))
+npsVSVLMCs <- DiffDown.exp[npsVSVLMCs,]
+DOWN <- row.names(emat_backSPIN) %in% row.names(DiffDown.exp)*1
+UP <- row.names(emat_backSPIN) %in% row.names(DiffUP.exp)*1
+GOenr = GOenrichmentAnalysis(UP, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/OLs.txt", sep = "\t")
+GOenr = GOenrichmentAnalysis(DOWN, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/OLs2.txt", sep = "\t")
+
+Diff_exp <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/EnrichedGenesPerPopulation/MarkerAllVLMCsNOPLC.txt",header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+DiffDown.exp <- Diff_exp[(Diff_exp$Z < 0) & (Diff_exp$pvalue < 0.01), ]
+DiffUP.exp <- Diff_exp[(Diff_exp$Z > 0) & (Diff_exp$pvalue < 0.01), ]
+OPCsVScopnfol <- intersect(AllTfsList,row.names(DiffUP.exp))
+OPCsVScopnfol <- DiffUP.exp[OPCsVScopnfol,]
+opcsVSCOPNFOLMFOL <- intersect(AllTfsList,row.names(DiffDown.exp))
+opcsVSCOPNFOLMFOL <- DiffDown.exp[opcsVSCOPNFOLMFOL,]
+DOWN <- row.names(emat_backSPIN) %in% row.names(DiffDown.exp)*1
+UP <- row.names(emat_backSPIN) %in% row.names(DiffUP.exp)*1
+GOenr = GOenrichmentAnalysis(UP, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/GVLMCsNOPLC.txt", sep = "\t")
+GOenr = GOenrichmentAnalysis(DOWN, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/VLMCsNOPLC2.txt", sep = "\t")
+
+Diff_exp <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/EnrichedGenesPerPopulation/MarkerAllVLMCsandPLC.txt",header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+DiffDown.exp <- Diff_exp[(Diff_exp$Z < 0) & (Diff_exp$pvalue < 0.01), ]
+DiffUP.exp <- Diff_exp[(Diff_exp$Z > 0) & (Diff_exp$pvalue < 0.01), ]
+OPC12VSopc3 <- intersect(AllTfsList,row.names(DiffUP.exp))
+OPC12VSopc3 <- DiffUP.exp[OPC12VSopc3,]
+opc12VSOPC3 <- intersect(AllTfsList,row.names(DiffDown.exp))
+opc12VSOPC3 <- DiffDown.exp[opc12VSOPC3,]
+DOWN <- row.names(emat_backSPIN) %in% row.names(DiffDown.exp)*1
+UP <- row.names(emat_backSPIN) %in% row.names(DiffUP.exp)*1
+GOenr = GOenrichmentAnalysis(UP, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/VLMCsandPLC.txt", sep = "\t")
+GOenr = GOenrichmentAnalysis(DOWN, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/VLMCsandPLC2.txt", sep = "\t")
+
+
+Diff_exp <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/EnrichedGenesPerPopulation/MarkerCOP.txt",header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+DiffDown.exp <- Diff_exp[(Diff_exp$Z < 0) & (Diff_exp$pvalue < 0.01), ]
+DiffUP.exp <- Diff_exp[(Diff_exp$Z > 0) & (Diff_exp$pvalue < 0.01), ]
+NP2VSnp3and1 <- intersect(AllTfsList,row.names(DiffUP.exp))
+NP2VSnp3and1 <- DiffUP.exp[NP2VSnp3and1,]
+np2VSNP3and1 <- intersect(AllTfsList,row.names(DiffDown.exp))
+np2VSNP3and1 <- DiffDown.exp[np2VSNP3and1,]
+DOWN <- row.names(emat_backSPIN) %in% row.names(DiffDown.exp)*1
+UP <- row.names(emat_backSPIN) %in% row.names(DiffUP.exp)*1
+GOenr = GOenrichmentAnalysis(UP, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/MarkerCOP.txt", sep = "\t")
+GOenr = GOenrichmentAnalysis(DOWN, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/MarkerCOP2.txt", sep = "\t")
+
+Diff_exp <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/EnrichedGenesPerPopulation/MarkerCycling.txt",header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+DiffDown.exp <- Diff_exp[(Diff_exp$Z < 0) & (Diff_exp$pvalue < 0.01), ]
+DiffUP.exp <- Diff_exp[(Diff_exp$Z > 0) & (Diff_exp$pvalue < 0.01), ]
+pnVLMC_VLMC_VS_evlmc_plc <- intersect(AllTfsList,row.names(DiffUP.exp))
+pnVLMC_VLMC_VS_evlmc_plc <- DiffUP.exp[pnVLMC_VLMC_VS_evlmc_plc,]
+pnvlmc_vlmc_VS_eVLMC_PLC <- intersect(AllTfsList,row.names(DiffDown.exp))
+pnvlmc_vlmc_VS_eVLMC_PLC <- DiffDown.exp[pnvlmc_vlmc_VS_eVLMC_PLC,]
+DOWN <- row.names(emat_backSPIN) %in% row.names(DiffDown.exp)*1
+UP <- row.names(emat_backSPIN) %in% row.names(DiffUP.exp)*1
+GOenr = GOenrichmentAnalysis(UP, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/Cycling.txt", sep = "\t")
+GOenr = GOenrichmentAnalysis(DOWN, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/GCycling2.txt", sep = "\t")
+
+Diff_exp <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/EnrichedGenesPerPopulation/MarkerMFOL.txt",header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+DiffDown.exp <- Diff_exp[(Diff_exp$Z < 0) & (Diff_exp$pvalue < 0.01), ]
+DiffUP.exp <- Diff_exp[(Diff_exp$Z > 0) & (Diff_exp$pvalue < 0.01), ]
+OPC1_VS_opc2 <- intersect(AllTfsList,row.names(DiffUP.exp))
+OPC1_VS_opc2 <- DiffUP.exp[OPC1_VS_opc2,]
+opc1_VS_OPC2 <- intersect(AllTfsList,row.names(DiffDown.exp))
+opc1_VS_OPC2 <- DiffDown.exp[opc1_VS_OPC2,]
+DOWN <- row.names(emat_backSPIN) %in% row.names(DiffDown.exp)*1
+UP <- row.names(emat_backSPIN) %in% row.names(DiffUP.exp)*1
+GOenr = GOenrichmentAnalysis(UP, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/MFOL.txt", sep = "\t")
+GOenr = GOenrichmentAnalysis(DOWN, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/MFOL2.txt", sep = "\t")
+
+Diff_exp <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/EnrichedGenesPerPopulation/MarkerNFOLsandMFOL.txt",header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+DiffDown.exp <- Diff_exp[(Diff_exp$Z < 0) & (Diff_exp$pvalue < 0.01), ]
+DiffUP.exp <- Diff_exp[(Diff_exp$Z > 0) & (Diff_exp$pvalue < 0.01), ]
+OPC1_VS_opc2 <- intersect(AllTfsList,row.names(DiffUP.exp))
+OPC1_VS_opc2 <- DiffUP.exp[OPC1_VS_opc2,]
+opc1_VS_OPC2 <- intersect(AllTfsList,row.names(DiffDown.exp))
+opc1_VS_OPC2 <- DiffDown.exp[opc1_VS_OPC2,]
+DOWN <- row.names(emat_backSPIN) %in% row.names(DiffDown.exp)*1
+UP <- row.names(emat_backSPIN) %in% row.names(DiffUP.exp)*1
+GOenr = GOenrichmentAnalysis(UP, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/NFOL.txt", sep = "\t")
+GOenr = GOenrichmentAnalysis(DOWN, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/NFOL2.txt", sep = "\t")
+
+
+Diff_exp <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/EnrichedGenesPerPopulation/MarkerNP1a.txt",header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+DiffDown.exp <- Diff_exp[(Diff_exp$Z < 0) & (Diff_exp$pvalue < 0.01), ]
+DiffUP.exp <- Diff_exp[(Diff_exp$Z > 0) & (Diff_exp$pvalue < 0.01), ]
+NP3_VS_np1 <- intersect(AllTfsList,row.names(DiffUP.exp))
+NP3_VS_np1 <- DiffUP.exp[NP3_VS_np1,]
+np3_VS_NP1 <- intersect(AllTfsList,row.names(DiffDown.exp))
+np3_VS_NP1 <- DiffDown.exp[np3_VS_NP1,]
+DOWN <- row.names(emat_backSPIN) %in% row.names(DiffDown.exp)*1
+UP <- row.names(emat_backSPIN) %in% row.names(DiffUP.exp)*1
+GOenr = GOenrichmentAnalysis(UP, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/NP1a.txt", sep = "\t")
+GOenr = GOenrichmentAnalysis(DOWN, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/NP1a2.txt", sep = "\t")
+
+Diff_exp <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/EnrichedGenesPerPopulation/MarkerNP1b.txt",header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+DiffDown.exp <- Diff_exp[(Diff_exp$Z < 0) & (Diff_exp$pvalue < 0.01), ]
+DiffUP.exp <- Diff_exp[(Diff_exp$Z > 0) & (Diff_exp$pvalue < 0.01), ]
+pnVLMC_VS_vlmc <- intersect(AllTfsList,row.names(DiffUP.exp))
+pnVLMC_VS_vlmc <- DiffUP.exp[pnVLMC_VS_vlmc,]
+pnvlmc_VS_VLMC <- intersect(AllTfsList,row.names(DiffDown.exp))
+pnvlmc_VS_VLMC <- DiffDown.exp[pnvlmc_VS_VLMC,]
+DOWN <- row.names(emat_backSPIN) %in% row.names(DiffDown.exp)*1
+UP <- row.names(emat_backSPIN) %in% row.names(DiffUP.exp)*1
+GOenr = GOenrichmentAnalysis(UP, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/NP1b.txt", sep = "\t")
+GOenr = GOenrichmentAnalysis(DOWN, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/NP1b2.txt", sep = "\t")
+
+Diff_exp <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/EnrichedGenesPerPopulation/MarkerNP2.txt",header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+DiffDown.exp <- Diff_exp[(Diff_exp$Z < 0) & (Diff_exp$pvalue < 0.01), ]
+DiffUP.exp <- Diff_exp[(Diff_exp$Z > 0) & (Diff_exp$pvalue < 0.01), ]
+NP1a_VS_np1b <- intersect(AllTfsList,row.names(DiffUP.exp))
+NP1a_VS_np1b <- DiffUP.exp[NP1a_VS_np1b,]
+np1a_VS_NP1b <- intersect(AllTfsList,row.names(DiffDown.exp))
+np1a_VS_NP1b <- DiffDown.exp[np1a_VS_NP1b,]
+DOWN <- row.names(emat_backSPIN) %in% row.names(DiffDown.exp)*1
+UP <- row.names(emat_backSPIN) %in% row.names(DiffUP.exp)*1
+GOenr = GOenrichmentAnalysis(UP, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/NP2.txt", sep = "\t")
+GOenr = GOenrichmentAnalysis(DOWN, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/NP22.txt", sep = "\t")
+
+Diff_exp <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/EnrichedGenesPerPopulation/MarkerNP3.txt",header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+DiffDown.exp <- Diff_exp[(Diff_exp$Z < 0) & (Diff_exp$pvalue < 0.01), ]
+DiffUP.exp <- Diff_exp[(Diff_exp$Z > 0) & (Diff_exp$pvalue < 0.01), ]
+PLC_VS_evlmc <- intersect(AllTfsList,row.names(DiffUP.exp))
+PLC_VS_evlmc <- DiffUP.exp[PLC_VS_evlmc,]
+plc_VS_eVLMC <- intersect(AllTfsList,row.names(DiffDown.exp))
+plc_VS_eVLMC <- DiffDown.exp[plc_VS_eVLMC,]
+DOWN <- row.names(emat_backSPIN) %in% row.names(DiffDown.exp)*1
+UP <- row.names(emat_backSPIN) %in% row.names(DiffUP.exp)*1
+GOenr = GOenrichmentAnalysis(UP, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/NP3.txt", sep = "\t")
+GOenr = GOenrichmentAnalysis(DOWN, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/NP32.txt", sep = "\t")
+
+
+Diff_exp <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/EnrichedGenesPerPopulation/MarkerOPC1.txt",header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+DiffDown.exp <- Diff_exp[(Diff_exp$Z < 0) & (Diff_exp$pvalue < 0.01), ]
+DiffUP.exp <- Diff_exp[(Diff_exp$Z > 0) & (Diff_exp$pvalue < 0.01), ]
+COPVSnfolmfol <- intersect(AllTfsList,row.names(DiffUP.exp))
+COPVSnfolmfol <- DiffUP.exp[COPVSnfolmfol,]
+copVSNFOLMFOL <- intersect(AllTfsList,row.names(DiffDown.exp))
+copVSNFOLMFOL <- DiffDown.exp[copVSNFOLMFOL,]
+DOWN <- row.names(emat_backSPIN) %in% row.names(DiffDown.exp)*1
+UP <- row.names(emat_backSPIN) %in% row.names(DiffUP.exp)*1
+GOenr = GOenrichmentAnalysis(UP, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/OPC1.txt", sep = "\t")
+GOenr = GOenrichmentAnalysis(DOWN, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/OPC12.txt", sep = "\t")
+
+Diff_exp <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/EnrichedGenesPerPopulation/MarkerOPC2.txt",header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+DiffDown.exp <- Diff_exp[(Diff_exp$Z < 0) & (Diff_exp$pvalue < 0.01), ]
+DiffUP.exp <- Diff_exp[(Diff_exp$Z > 0) & (Diff_exp$pvalue < 0.01), ]
+COPVSnfolmfol <- intersect(AllTfsList,row.names(DiffUP.exp))
+COPVSnfolmfol <- DiffUP.exp[COPVSnfolmfol,]
+copVSNFOLMFOL <- intersect(AllTfsList,row.names(DiffDown.exp))
+copVSNFOLMFOL <- DiffDown.exp[copVSNFOLMFOL,]
+DOWN <- row.names(emat_backSPIN) %in% row.names(DiffDown.exp)*1
+UP <- row.names(emat_backSPIN) %in% row.names(DiffUP.exp)*1
+GOenr = GOenrichmentAnalysis(UP, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/OPC2.txt", sep = "\t")
+GOenr = GOenrichmentAnalysis(DOWN, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/OPC22.txt", sep = "\t")
+
+Diff_exp <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/EnrichedGenesPerPopulation/MarkerOPC3.txt",header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+DiffDown.exp <- Diff_exp[(Diff_exp$Z < 0) & (Diff_exp$pvalue < 0.01), ]
+DiffUP.exp <- Diff_exp[(Diff_exp$Z > 0) & (Diff_exp$pvalue < 0.01), ]
+COPVSnfolmfol <- intersect(AllTfsList,row.names(DiffUP.exp))
+COPVSnfolmfol <- DiffUP.exp[COPVSnfolmfol,]
+copVSNFOLMFOL <- intersect(AllTfsList,row.names(DiffDown.exp))
+copVSNFOLMFOL <- DiffDown.exp[copVSNFOLMFOL,]
+DOWN <- row.names(emat_backSPIN) %in% row.names(DiffDown.exp)*1
+UP <- row.names(emat_backSPIN) %in% row.names(DiffUP.exp)*1
+GOenr = GOenrichmentAnalysis(UP, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/OPC3.txt", sep = "\t")
+GOenr = GOenrichmentAnalysis(DOWN, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/OPC32.txt", sep = "\t")
+
+Diff_exp <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/EnrichedGenesPerPopulation/MarkerOPCs.txt",header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+DiffDown.exp <- Diff_exp[(Diff_exp$Z < 0) & (Diff_exp$pvalue < 0.01), ]
+DiffUP.exp <- Diff_exp[(Diff_exp$Z > 0) & (Diff_exp$pvalue < 0.01), ]
+COPVSnfolmfol <- intersect(AllTfsList,row.names(DiffUP.exp))
+COPVSnfolmfol <- DiffUP.exp[COPVSnfolmfol,]
+copVSNFOLMFOL <- intersect(AllTfsList,row.names(DiffDown.exp))
+copVSNFOLMFOL <- DiffDown.exp[copVSNFOLMFOL,]
+DOWN <- row.names(emat_backSPIN) %in% row.names(DiffDown.exp)*1
+UP <- row.names(emat_backSPIN) %in% row.names(DiffUP.exp)*1
+GOenr = GOenrichmentAnalysis(UP, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/OPCs.txt", sep = "\t")
+GOenr = GOenrichmentAnalysis(DOWN, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/OPCs2.txt", sep = "\t")
+
+Diff_exp <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/EnrichedGenesPerPopulation/MarkerPLC.txt",header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+DiffDown.exp <- Diff_exp[(Diff_exp$Z < 0) & (Diff_exp$pvalue < 0.01), ]
+DiffUP.exp <- Diff_exp[(Diff_exp$Z > 0) & (Diff_exp$pvalue < 0.01), ]
+COPVSnfolmfol <- intersect(AllTfsList,row.names(DiffUP.exp))
+COPVSnfolmfol <- DiffUP.exp[COPVSnfolmfol,]
+copVSNFOLMFOL <- intersect(AllTfsList,row.names(DiffDown.exp))
+copVSNFOLMFOL <- DiffDown.exp[copVSNFOLMFOL,]
+DOWN <- row.names(emat_backSPIN) %in% row.names(DiffDown.exp)*1
+UP <- row.names(emat_backSPIN) %in% row.names(DiffUP.exp)*1
+GOenr = GOenrichmentAnalysis(UP, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/PLC.txt", sep = "\t")
+GOenr = GOenrichmentAnalysis(DOWN, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/PLC2.txt", sep = "\t")
+
+Diff_exp <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/EnrichedGenesPerPopulation/MarkerVLMC.txt",header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+DiffDown.exp <- Diff_exp[(Diff_exp$Z < 0) & (Diff_exp$pvalue < 0.01), ]
+DiffUP.exp <- Diff_exp[(Diff_exp$Z > 0) & (Diff_exp$pvalue < 0.01), ]
+COPVSnfolmfol <- intersect(AllTfsList,row.names(DiffUP.exp))
+COPVSnfolmfol <- DiffUP.exp[COPVSnfolmfol,]
+copVSNFOLMFOL <- intersect(AllTfsList,row.names(DiffDown.exp))
+copVSNFOLMFOL <- DiffDown.exp[copVSNFOLMFOL,]
+DOWN <- row.names(emat_backSPIN) %in% row.names(DiffDown.exp)*1
+UP <- row.names(emat_backSPIN) %in% row.names(DiffUP.exp)*1
+GOenr = GOenrichmentAnalysis(UP, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/VLMC.txt", sep = "\t")
+GOenr = GOenrichmentAnalysis(DOWN, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/VLMC2.txt", sep = "\t")
+
+Diff_exp <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/EnrichedGenesPerPopulation/MarkereVLMC.txt",header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+DiffDown.exp <- Diff_exp[(Diff_exp$Z < 0) & (Diff_exp$pvalue < 0.01), ]
+DiffUP.exp <- Diff_exp[(Diff_exp$Z > 0) & (Diff_exp$pvalue < 0.01), ]
+COPVSnfolmfol <- intersect(AllTfsList,row.names(DiffUP.exp))
+COPVSnfolmfol <- DiffUP.exp[COPVSnfolmfol,]
+copVSNFOLMFOL <- intersect(AllTfsList,row.names(DiffDown.exp))
+copVSNFOLMFOL <- DiffDown.exp[copVSNFOLMFOL,]
+DOWN <- row.names(emat_backSPIN) %in% row.names(DiffDown.exp)*1
+UP <- row.names(emat_backSPIN) %in% row.names(DiffUP.exp)*1
+GOenr = GOenrichmentAnalysis(UP, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/eVLMC.txt", sep = "\t")
+GOenr = GOenrichmentAnalysis(DOWN, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/eVLMC2.txt", sep = "\t")
+
+Diff_exp <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/EnrichedGenesPerPopulation/MarkerpnVLMC.txt",header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+DiffDown.exp <- Diff_exp[(Diff_exp$Z < 0) & (Diff_exp$pvalue < 0.01), ]
+DiffUP.exp <- Diff_exp[(Diff_exp$Z > 0) & (Diff_exp$pvalue < 0.01), ]
+COPVSnfolmfol <- intersect(AllTfsList,row.names(DiffUP.exp))
+COPVSnfolmfol <- DiffUP.exp[COPVSnfolmfol,]
+copVSNFOLMFOL <- intersect(AllTfsList,row.names(DiffDown.exp))
+copVSNFOLMFOL <- DiffDown.exp[copVSNFOLMFOL,]
+DOWN <- row.names(emat_backSPIN) %in% row.names(DiffDown.exp)*1
+UP <- row.names(emat_backSPIN) %in% row.names(DiffUP.exp)*1
+GOenr = GOenrichmentAnalysis(UP, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/pnVLMC.txt", sep = "\t")
+GOenr = GOenrichmentAnalysis(DOWN, allLLIDs, organism = "mouse", nBestP = 50, backgroundType = "allGiven");
+tab = GOenr$bestPTerms[[4]]$enrichment
+tab <- subset(tab,tab$module %in% "1")
+write.table(tab, file = "~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/GOtermsSCDEdendo/pnVLMC2.txt", sep = "\t")
+```
+
+Generating Supplementary Figure 4
+```{r}
+FilteredbackSPIN <- networkAnnotableFile[names(MNEclasses),10] 
+clustFiltered <- cluster[row.names(annotable_backSPIN)]
+
+ggplot(as.data.frame(tsne_out$Y), aes(x=V1, y=V2, colour=clustFiltered)) +
+  geom_point(size=5) + geom_density2d(alpha=0.0,size=0.5, color="black", bins=10)  + #scale_colour_gradient(low = "red", high = "white") +
+  theme(strip.background = element_blank(), strip.text.x = element_blank(),axis.text.x = element_blank(),axis.text.y= element_blank(),axis.ticks= element_blank(),axis.line  = element_blank(),panel.border = element_blank(),legend.position  = "right") + 
+  xlab("tSNE_1") + ylab("tSNE_2") + 
+  theme_bw() +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) 
+
+ggplot(as.data.frame(tsne_out$Y), aes(x=V1, y=V2, colour=annotable_backSPIN$cell_class)) +
+  geom_point(size=5) + geom_density2d(alpha=0.0,size=0.5, color="black", bins=10)  + #scale_colour_gradient(low = "red", high = "white") +
+  theme(strip.background = element_blank(), strip.text.x = element_blank(),axis.text.x = element_blank(),axis.text.y= element_blank(),axis.ticks= element_blank(),axis.line  = element_blank(),panel.border = element_blank(),legend.position  = "right") + 
+  xlab("tSNE_1") + ylab("tSNE_2") + 
+  theme_bw() +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) 
+```
+Clusters comparison
+```{r}
+# A function to prepare generic cluster output
+# from apcluster result.
+# Returns a vector of cluster labels, where the names
+# of the vector are the cell IDs.
+getClusters <- function(x) {
+  # x - APResult or ExClust object
+  
+  cl <- vector()
+  for(i in 1:length(x)) {
+    cl <- rbind(cl, cbind(names(x[[i]]),i))
+  }
+  rownames(cl) <- cl[,1]
+  return(cl[,2])
+}
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+# A function for plotting clustering results in 2D:
+plotClust <- function(cl, xy, main="", seed, ...) {
+  # cl - clustering vector, e.g. as returned by getClusters
+  # xy - xy coordinates
+  # main - plot title
+  
+  if(!all(sort(names(cl))==sort(rownames(xy)))) {
+    stop("names of cl do not match rownames of xy") 
+  }
+  cl <- cl[rownames(xy)]
+  col <- rainbow(length(unique(cl)))
+  if(!missing(seed)) {
+    set.seed(seed)
+    col <- sample(col, length(col))
+  }
+  col <- col[as.numeric(as.factor(cl))]
+  plot(xy, col=col, main=main, ...)
+}
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+# Function for comparing clusterings:
+clustDist <- function(clList, method="VI", heatmap=TRUE) {
+  # clList - list of clustering vectors, e.g. as returned by getClusters
+  # method - "VI" (Variation of Information Distance) or "adjRand" (Adjusted Rand Index)
+  # heatmap - draw heatmap, TRUE/FALSE
+  
+  require("NMF")
+  require("mcclust")
+  require("mclust")
+  
+  # Check that all elements of clList contain the same sample names:
+  if(suppressWarnings(!all(unlist(lapply(clList, function(x) all(sort(names(x))==sort(names(clList[[1]])))))))) {
+    stop("Elements of clList do not contain the same names")    
+  }
+  
+  # Merge the elements of clList to a matrix:
+  idx <- names(clList[[1]])
+  clmat <- do.call(cbind, lapply(clList, function(x) x[idx]))
+  colnames(clmat) <- paste(names(clList)," (k=", apply(clmat,2,function(x) length(unique(x))), ")", sep="")
+  
+  # Calculate distances between all clustering pairs:
+  dmat <- matrix(nrow=ncol(clmat), ncol=ncol(clmat))
+  for(i in 1:ncol(clmat)) {
+    for(j in 1:ncol(clmat)) {
+      if(method=="VI") {
+      dmat[i,j] <- vi.dist(clmat[,i], clmat[,j]) 
+      } else if(method=="adjRand") {
+        dmat[i,j] <- 1 - adjustedRandIndex(clmat[,i], clmat[,j]) 
+      }
+    }
+  }
+  colnames(dmat) <- rownames(dmat) <- colnames(clmat)
+  
+  # Plot heatmap of clustering similarities:
+  if(heatmap) {
+    aheatmap(dmat, col=colorRampPalette(c("forestgreen","lightblue","white"))(100),
+             main=ifelse(method=="VI","Variation of Information Distance",
+                         ifelse(method=="adjRand","1 - Adjusted Rand Index","")))
+  }
+  
+  # Return the calculated distance matrix:
+  invisible(dmat)
+}
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+# A function to calculate the Shannon entropy for a given cell,
+# based on the frequency of cluster members across clusterings:
+calcEntropy <- function(cellID, clList, method="Jeffreys") {
+  # cellID - character string giving the cell ID
+  # clList - list of clustering vectors, e.g. as returned by getClusters
+  
+  require("entropy")
+  # Get all the cells in the same cluster as the given cell (cellID).
+  # Do this for all clusterings and make a list:
+  setList <- lapply(clList, function(x) names(x[x==x[names(x)==cellID]]))
+  tmp <- unlist(setList)
+  # Old version (don't run):
+  if(F) { 
+    tmp <- tmp[tmp != cellID] # remove the given cell (cellID)
+    entropy::entropy(table(tmp))
+  }
+  # New version:
+  # For each cell, count the appearance in the clusters across clusterings:
+  tmp <- c(table(tmp),rep(0,length(unique(names(unlist(clList[[1]]))))-length(table(tmp))))
+  entropy::entropy(tmp, method=method)
+}
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+# Compare the clustering consistency per cell for two clusterings.
+# This is done by considering a Venn diagram of the neighbor cells (i.e.
+# cells in the same cluster) for both clusterings. The consistency of a
+# cell (sim) is taken as the fraction of unique cells (non-overlapping) 
+# in the smallest cluster.
+#      
+#      _   __ 
+#  A /  / \   \ B         A and B are the set of neighbors to a 
+#   |x | y |   |          given cell from each clustering.
+#    \ _\ /__ /           If A is smallest: sim = x / (x + y)
+#  
+plotCellConsist <- function(cl1, cl2, xy, plot=T) { 
+  # cl1, cl2 - clustering vectors, matching names but can be different order
+  # xy - xy coordinates with rownames mathcing cl1 and cl2
+  
+  # Error checking:
+  if(length(cl1)!=length(cl2)) stop("unequal clustering vector lengths")
+  if(!all(names(cl1)%in%names(cl2))) stop("unequal clustering vector names")
+  if(!all(rownames(xy)%in%names(cl1))) stop("unequal rownames in xy and clusterings")
+  
+  # Caclulate clustering similarity per cell:
+  sim <- rep(NA, length(cl1))
+  for(i in 1:length(cl1)) {
+    cell <- names(cl1)[i]
+    neighbors1 <- setdiff(names(cl1[cl1==cl1[cell]]), cell)
+    neighbors2 <- setdiff(names(cl2[cl2==cl2[cell]]), cell)
+    if(length(neighbors1)>length(neighbors2)) {
+      sim[i] <- length(setdiff(neighbors2, neighbors1)) / length(neighbors2)
+    } else {
+      sim[i] <- length(setdiff(neighbors1, neighbors2)) / length(neighbors1)
+    }
+    names(sim) <- names(cl1)
+  }
+  
+  # Plotting (optional):
+  if(plot) {
+    par(mfrow=c(2,2))
+    # Plot clusterings:
+    plotClust(cl1, xy, main="Clustering 1", xlab="", ylab="")
+    plotClust(cl2, xy, main="Clustering 2", xlab="", ylab="")
+    # Plot bad consistency:
+    cols <- colorRampPalette(c("gray","grey","grey","pink","red"))(1000)
+    sim_scaled <- ceiling(sim[rownames(xy)]*999+1) # colors from sim
+    plot(xy, col=cols[sim_scaled], main="Inconsistent cells", xlab="", ylab="")
+    # Plot good consistency:
+    cols <- colorRampPalette(c("green","lightgreen","grey","gray"))(1000)
+    sim_scaled <- ceiling(sim[rownames(xy)]*999+1) # colors from sim
+    plot(xy, col=cols[sim_scaled], main="Consistent cells", xlab="", ylab="")
+    par(mfrow=c(1,1))
+  }
+  
+  # Return similarity:
+  invisible(sim)
+}
+
+```
+Make cluster comparison heatmap
+```{r, fig.height=5}
+PAGODAclusterreordered <- factor(PAGODAcluster, levels=c("15","9","3","8","2","1","4","5","11","14","6","7","12","13","10"))
+BackSPINmainClustersordered <- factor(BackSPINmainClusters, levels=c("10","15","13","3","5","4","1","11","14","2","9","6","7","12"))
+clustcompare <- table(BackSPINmainClustersordered,PAGODAclusterreordered)
+#plot(table(BackSPINmainClusters,PAGODAcluster))
+#clustcompare <- prop.table(table(BackSPINmainClustersordered,PAGODAclusterreordered))
+#prop.table(table(BackSPINmainClusters,PAGODAclusterreordered))
+library(heatmap3)
+#table(BackSPINmainClusters,PAGODAcluster)
+#clustcompare <- as.data.frame.matrix(clustcompare[order(clustcompare[,ncol(clustcompare)],decreasing=T),])
+#clustcompare <- clustcompare[order(clustcompare[,nrow(clustcompare)],decreasing=T),]
+heatmap3(clustcompare, Rowv = NA , Colv = NA ,scale = "none",symm = F, method = "ward.D2",col=colorRampPalette(c("#ffffbf","#d7191c",
+"#d7191c"))(1024),balanceColor =F)
+
+library(corrplot)
+corrplot(clustcompare, "circle", "full",is.corr = FALSE,order = "original",col=colorRampPalette(c("#ffffbf","#d7191c"))(200))
+```
+OPC lineage trace ionchannel tSNEs
+```{r}
+#LinTraceOPCs
+#annotable_LinTraceOPCs
+
+GlutGenes <- c("Gria1","Gria2","Gria3","Gria4","Grik1","Grik2","Grik3","Grik4","Grik5","Grin1","Grin2a","Grin2b","Grin2c","Grin2d","Grin3a","Grin3b")
+GlutChannels <- rowSums(as.data.frame(LinTraceOPCs[GlutGenes,]))
+GlutChannelsVAR <- mean(apply(LinTraceOPCs[GlutGenes,],2,var))
+PottasiumGenes <- c("Kcnj2","Kcnj1","Kcnj12","Kcnj4","Kcnj14","Kcnj3","Kcnj6","Kcnj9","Kcnj10","Kcnj15","Kcnj16","Kcnj8","Kcnj11","Kcnj13","Kcna1","Kcna2","Kcna3","Kcna5","Kcna6","Kcnab1","Kcnab2","Kcnc1","Kcnc2","Kcnq1","Kcnq2","Kcnq3","Kcnh1","Kcnh2","Kcnh7","Kcna4","Kcnc3","Kcnc4","Kcnd1","Kcnd2","Kcnh5")
+PottasiumChannels <- rowSums(as.data.frame(LinTraceOPCs[PottasiumGenes,]))
+PottasiumChannelsVAR <- apply(LinTraceOPCs[PottasiumGenes,],2,var)
+VoltageGenes <- c("Scn1a","Scn3a","Scn8a","Scn9a","Scn10a","Scn11a","Scn1b","Scn2b","Scn3b","Scn4b")
+VoltageGated <- mean(rowSums(as.data.frame(LinTraceOPCs[VoltageGenes,])))
+VoltageGatedVAR <- mean(apply(LinTraceOPCs[VoltageGenes,],2,var))
+GabraGenes <- c("Gabra1","Gabra2","Gabra3","Gabra4","Gabra5","Gabra6","Gabrb1","Gabrb2","Gabrb3","Gabrd","Gabre","Gabrg1","Gabrg2","Gabrg3","Gabrp","Gabrq","Gabrr1","Gabrr2","Gabrr3","Gabbr1","Gabbr2")
+GABA <- rowSums(as.data.frame(t(LinTraceOPCs[GabraGenes,])))
+GABAVAR <- mean(apply(LinTraceOPCs[GabraGenes,],2,var))
+alliongenes <- union(union(GlutGenes,PottasiumGenes),union(VoltageGenes,GabraGenes))
+allionmeanVAR <- mean(apply(LinTraceOPCs[alliongenes,],2,var))
+allionVAR <- apply(LinTraceOPCs[alliongenes,],2,var)
+
+aggregate(allionVAR~as.factor(annotable_LinTraceOPCs$LineageTrace), FUN=mean)
+bartlett.test(allionVAR, as.factor(annotable_LinTraceOPCs$LineageTrace))
+fligner.test(allionVAR, as.factor(annotable_LinTraceOPCs$LineageTrace))
+fit = lm(formula = allionVAR ~ as.factor(annotable_LinTraceOPCs$LineageTrace))
+anova(fit)
+```
+
+```{r}
+CVsq <- function(x) {(sd(x)/mean(x))^2}
+emat_expressed <- apply(LinTraceOPCs,1,function(x) any ((x) >= 1))
+emat_expressed <- LinTraceOPCs[emat_expressed,]
+#emat_expressed <- apply(emat_backSPIN,1,function(x) var(x) > 0)
+#emat_expressed <- emat[emat_expressed,]
+CV2 <- apply(emat_expressed,1,CVsq)
+meancounts <- apply(emat_expressed,1,mean)
+CV2_matrix <- matrix(c(log(meancounts),log(CV2)),nrow = length(CV2),ncol = 2)
+row.names(CV2_matrix) <- names(CV2)
+colnames(CV2_matrix) <- c("LogExpr","CV2")
+CV2_matrix <- as.data.frame(CV2_matrix)
+#plot(CV2_matrix,xlab ="Mean Count Magnitude (log)",ylab="Squared Coefficient of Variation", pch=20, cex=0.3)
+library(e1071)
+model <- svm(CV2 ~ LogExpr ,CV2_matrix, gamma = 0.06)
+predictedY <- predict(model, CV2_matrix)
+#plot(CV2_matrix,xlab ="Mean Count Magnitude (log)",ylab="Squared Coefficient of Variation", pch=20, cex=0.3)
+#points(CV2_matrix$LogExpr,predictedY, col="red",pch=20, cex=0.1)
+CV2_matrix <- cbind(CV2_matrix,predictedY)
+CV2_matrix$RelativeVariance <-CV2_matrix$CV2 - CV2_matrix$predictedY
+NormGenes <- row.names(subset(CV2_matrix, RelativeVariance > 0))
+NormGenesFactor <- as.factor(1*(CV2_matrix$RelativeVariance > 0))
+plot(CV2_matrix$LogExpr,CV2_matrix$CV2,xlab ="Mean Count Magnitude (log)",ylab="Squared Coefficient of Variation", pch=20, cex=0.3, col=NormGenesFactor)
+points(CV2_matrix$LogExpr,predictedY, col="green",pch=20, cex=0.1)
+length(NormGenes)
+```
+```{r, echo=FALSE, fig.height=5, message=FALSE, warning=FALSE}
+NormGenes <- subset(NormGenes,! NormGenes %in% c("Xist","Tsix"))
+pca <- prcomp(t(log(LinTraceOPCs[alliongenes,]+1)),scale. = FALSE)
+tsne <- t(pca$x[,c(1:5)])
+library(Rtsne)
+set.seed(123456789)
+tsne_out <- Rtsne(t(tsne), initial_dims=20, perplexity=30,max_iter = 1000,check_duplicates = FALSE,
+                  verbose = TRUE, theta = 0.0, pca = FALSE)
+rownames(tsne_out$Y) <- colnames(tsne)
+#save tSNE coordinates
+#saveRDS(tsne_out$Y,"tSNEcoordinates.rds")
+
+
+FinalClustersOrdered <- factor(annotable_LinTraceOPCs$FinalClusters, levels=c("OPC1","OPC2","OPC3","COP","NFOL","Cycling","NP1a","NP1b","NP2","NP3","eVLMC","PLC","pnVLMC","VLMC"))
+palette <- c("#c6dbef","#6baed6","#08519c","#006d2c","#41ab5d","#000000","#cab2d6","#6a3d9a","#dadaeb","#c994c7","#fcbba1","#ef3b2c","#a63603","#f16913")
+ggplot(as.data.frame(tsne_out$Y), aes(x=V1, y=V2, colour=FinalClustersOrdered)) +
+  geom_point(size=5) + geom_density2d(alpha=0.0,size=0.1, color="black", bins=10)  + (scale_colour_manual(FinalClustersOrdered,values=palette)) +
+  theme(strip.background = element_blank(), strip.text.x = element_blank(),axis.text.x = element_blank(),axis.text.y= element_blank(),axis.ticks= element_blank(),axis.line  = element_blank(),panel.border = element_blank(),legend.position  = "right") + 
+  xlab("tSNE_1") + ylab("tSNE_2")  +
+  theme_bw() +
+  theme(axis.line = element_line(colour = "black"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       panel.border = element_blank(),
+       panel.background = element_blank())
+LinTraceordered <- revalue(as.factor(annotable_LinTraceOPCs$cell_class), c("OPC"="Other",
+                                                                       "COP"="Other",
+                                                                       "VLMC"="Other",
+                                                                       "P7-Brain"="Other",
+                                                                       "P7-Spinal-Cord"="Other",
+                                                                       "E13.5-Brain"="Other",
+                                                                       "E13.5-Spinal-Cord"="Other",
+                                                                       "E13.5 Lineage trace"="E13.5 Lineage trace",
+                                                                       "P3 Lineage trace"="P3 Lineage trace"))
+#LinTraceordered <- factor(LinTraceordered, levels=c("E13.5 Lineage trace","P3 Lineage trace","Other"))
+#palette <- c("#d3d3d3","#e41a1c","#377eb8")
+ggplot(as.data.frame(tsne_out$Y), aes(x=V1, y=V2, colour=LinTraceordered)) +
+  geom_point(size=5) + geom_density2d(alpha=0.0,size=0.5, color="black", bins=10)  +#+ (scale_colour_manual(LinTraceordered,values=palette)) +
+  theme(strip.background = element_blank(), strip.text.x = element_blank(),axis.text.x = element_blank(),axis.text.y= element_blank(),axis.ticks= element_blank(),axis.line  = element_blank(),panel.border = element_blank(),legend.position  = "right") + 
+  xlab("tSNE_1") + ylab("tSNE_2") + 
+  theme_bw() +
+  theme(axis.line = element_line(colour = "black"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       panel.border = element_blank(),
+       panel.background = element_blank())
+
+plot(pca$x[,1:2],col=as.factor(annotable_LinTraceOPCs$LineageTrace))
+```
+
+```{r, fig.height=10}
+LinTraceOPCs_expressed <- apply(LinTraceOPCs[alliongenes,],1,function(x) any ((x) >= 1))
+LinTraceOPCs_expressed <- LinTraceOPCs[alliongenes,][LinTraceOPCs_expressed,]
+LinTraceOPCs_expressed2 <- apply(LinTraceOPCs_expressed,2,function(x) any ((x) >= 1))
+LinTraceOPCs_expressed <- LinTraceOPCs_expressed[,LinTraceOPCs_expressed2]
+cols <- palette[as.factor(annotable_LinTraceOPCs[colnames(LinTraceOPCs_expressed),]$LineageTrace)]
+heatmap3(log(LinTraceOPCs_expressed+1),ColSideColors=cols, Rowv =NULL , Colv = NA ,scale = "none",symm = F, method = "ward.D2",col=colorRampPalette(c("#2c7bb6","#ffffbf",
+"#d7191c"))(1024),balanceColor =F)
+
+```
+```{r, fig.height=4}
+noveltranscripts <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/NcRNAMarkers/GeneListncRNAs.txt")
+palette <- c("#c6dbef","#6baed6","#08519c","#006d2c","#41ab5d","#000000","#cab2d6","#6a3d9a","#dadaeb","#c994c7","#fcbba1","#ef3b2c","#a63603","#f16913")
+cols <- palette[as.factor(backSPINordered2)]
+test <- emat_backSPINorderedfix[as.character(noveltranscripts[,2])]
+heatmap3(log(t(test)+1),ColSideColors=cols, Rowv =NULL , Colv = NA ,scale = "none",symm = F, method = "ward.D2",col=colorRampPalette(c("#2c7bb6","#ffffbf",
+"#d7191c"))(1024),balanceColor =F)
+```
+
+```{r, fig.height=5}
+Diff_exp <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/DendoComparisons/Lev4b_OPC1_VS_OPC2.txt",header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+DiffDown.exp <- Diff_exp[(Diff_exp$Z < 0) & (Diff_exp$pvalue < 0.00001), ]
+DiffUP.exp <- Diff_exp[(Diff_exp$Z > 0) & (Diff_exp$pvalue < 0.00001), ]
+
+OPCgenes <- union(row.names(DiffUP.exp),row.names(DiffDown.exp))
+
+Diff_exp <- read.table("~/Documents/SingleCellData/GitCloneWABI/E13.5-P7/MarkersSCDE/DendoComparisons/Lev3B_OPC12VSOPC3.txt",header=TRUE, sep="\t", as.is=TRUE, check.names=FALSE)
+DiffDown.exp <- Diff_exp[(Diff_exp$Z < 0) & (Diff_exp$pvalue < 0.01), ]
+DiffUP.exp <- Diff_exp[(Diff_exp$Z > 0) & (Diff_exp$pvalue < 0.01), ]
+
+OPC3genes <- union(row.names(DiffUP.exp),row.names(DiffDown.exp))
+
+OPCclustergenes <-union(OPCgenes,OPC3genes)
+
+palette <- c("#c6dbef","#6baed6","#08519c")
+cols <- palette[as.factor(annotable_OPCs$FinalClusters)]
+heatmap3(log(ematOPCs[OPCclustergenes,]+1),ColSideColors=cols, Rowv =NULL , Colv = NULL ,scale = "none",symm = F, method = "ward.D2",col=colorRampPalette(c("#2c7bb6","#ffffbf",
+"#d7191c"))(1024),balanceColor =F)
+```

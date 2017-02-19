@@ -1,0 +1,108 @@
+---
+title: "PAGODA cluster finder"
+output: html_notebook
+---
+PAGODA Cluster finder
+```{r}
+# filter out cells that don't show positive correlation with
+# the expected expression magnitudes (very poor fits)
+valid.cells <- o.ifm$corr.a > 0
+table(valid.cells)
+
+o.ifm <- o.ifm[valid.cells, ]
+
+# estimate gene expression prior
+o.prior <- scde.expression.prior(models = o.ifm, counts = cd, length.out = 400, show.plot = FALSE)
+
+
+```
+
+```{r}
+#Once PAGODA is finished you can use this script (and a bit of manual labour) to test whether or not the cluster split passes the threshold test
+#Identify the cluster splitpoint
+col.cols <- rbind(groups = cutree(hc, 9))
+table(col.cols)
+col.cols2 <- rbind(groups = cutree(hc, 10))
+table(col.cols2)
+```
+```{r}
+#Label the clusters for SCDE
+cluster <- as.factor(rbind(groups = cutree(hc, 10)))
+names(cluster) <- colnames(cd)
+PAGODAtest <-  factor(gsub("(2|4)", "\\1", cluster), levels  =  c("2", "4"))
+table(PAGODAtest)
+test1 <- cd[,names(subset(cluster, cluster %in% c("2")))]
+test2 <- cd[,names(subset(cluster, cluster %in% c("4")))]
+
+#Select genes that are expressed in at least 60% of the cells within the population
+countcells <- apply(test1,1,function(x) sum(x > 1))
+countcells <- countcells/ncol(test1)
+countcells <- countcells >= 0.6
+test1 <- test1[countcells,]
+
+countcells <- apply(test2,1,function(x) sum(x > 1))
+countcells <- countcells/ncol(test2)
+countcells <- countcells >= 0.6
+test2 <- test2[countcells,]
+
+#Select genes that show low within cluster variance
+CVsq <- function(x) {(sd(x)/mean(x))^2}
+emat_expressed <- apply(test1,1,function(x) any ((x) >= 2))
+emat_expressed <- test1[emat_expressed,]
+CV2 <- apply(emat_expressed,1,CVsq)
+meancounts <- apply(emat_expressed,1,mean)
+CV2_matrix <- matrix(c(log(meancounts),log(CV2)),nrow = length(CV2),ncol = 2)
+row.names(CV2_matrix) <- names(CV2)
+colnames(CV2_matrix) <- c("LogExpr","CV2")
+CV2_matrix <- as.data.frame(CV2_matrix)
+#plot(CV2_matrix,xlab ="Mean Count Magnitude (log)",ylab="Squared Coefficient of Variation", pch=20, cex=0.3)
+library(e1071)
+model <- svm(CV2 ~ LogExpr ,CV2_matrix, gamma = 0.06)
+predictedY <- predict(model, CV2_matrix)
+#plot(CV2_matrix,xlab ="Mean Count Magnitude (log)",ylab="Squared Coefficient of Variation", pch=20, cex=0.3)
+#points(CV2_matrix$LogExpr,predictedY, col="red",pch=20, cex=0.1)
+CV2_matrix <- cbind(CV2_matrix,predictedY)
+CV2_matrix$RelativeVariance <-CV2_matrix$CV2 - CV2_matrix$predictedY
+RelativeVar1 <- CV2_matrix$RelativeVariance
+NormGenes1 <- row.names(subset(CV2_matrix, RelativeVariance < 0))
+NormGenesFactor <- as.factor(1*(CV2_matrix$RelativeVariance < 0))
+plot(CV2_matrix$LogExpr,CV2_matrix$CV2,xlab ="Mean Count Magnitude (log)",ylab="Squared Coefficient of Variation", pch=20, cex=0.3, col=NormGenesFactor)
+points(CV2_matrix$LogExpr,predictedY, col="green",pch=20, cex=0.1)
+length(NormGenes1)
+
+CVsq <- function(x) {(sd(x)/mean(x))^2}
+emat_expressed <- apply(test2,1,function(x) any ((x) >= 2))
+emat_expressed <- test2[emat_expressed,]
+CV2 <- apply(emat_expressed,1,CVsq)
+meancounts <- apply(emat_expressed,1,mean)
+CV2_matrix <- matrix(c(log(meancounts),log(CV2)),nrow = length(CV2),ncol = 2)
+row.names(CV2_matrix) <- names(CV2)
+colnames(CV2_matrix) <- c("LogExpr","CV2")
+CV2_matrix <- as.data.frame(CV2_matrix)
+#plot(CV2_matrix,xlab ="Mean Count Magnitude (log)",ylab="Squared Coefficient of Variation", pch=20, cex=0.3)
+library(e1071)
+model <- svm(CV2 ~ LogExpr ,CV2_matrix, gamma = 0.06)
+predictedY <- predict(model, CV2_matrix)
+#plot(CV2_matrix,xlab ="Mean Count Magnitude (log)",ylab="Squared Coefficient of Variation", pch=20, cex=0.3)
+#points(CV2_matrix$LogExpr,predictedY, col="red",pch=20, cex=0.1)
+CV2_matrix <- cbind(CV2_matrix,predictedY)
+CV2_matrix$RelativeVariance <-CV2_matrix$CV2 - CV2_matrix$predictedY
+RelativeVar2 <- CV2_matrix$RelativeVariance
+NormGenes2 <- row.names(subset(CV2_matrix, RelativeVariance < 0))
+NormGenesFactor <- as.factor(1*(CV2_matrix$RelativeVariance < 0))
+plot(CV2_matrix$LogExpr,CV2_matrix$CV2,xlab ="Mean Count Magnitude (log)",ylab="Squared Coefficient of Variation", pch=20, cex=0.3, col=NormGenesFactor)
+points(CV2_matrix$LogExpr,predictedY, col="green",pch=20, cex=0.1)
+length(NormGenes2)
+
+NormGenes <- union(NormGenes1,NormGenes2)
+library(scde)
+#Perform the differential expression and test if the split is valid or not.
+test.diff <- scde.expression.difference(o.ifm, cd, o.prior, groups  =  PAGODAtest, n.randomizations  =  100, n.cores  =  6, verbose  =  1)
+test.diff$pvalue <- 1-pnorm(abs(test.diff$Z))
+# top upregulated genes (tail would show top downregulated ones)
+test.difffilter <- test.diff[NormGenes,]
+test.SCDE <- mean(head(test.difffilter[order(abs(test.difffilter$pvalue),abs(test.difffilter$ce), decreasing  =  FALSE),],n=20)$pvalue)
+test.SCDE < 0.01
+
+```
+
